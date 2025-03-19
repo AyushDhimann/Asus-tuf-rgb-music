@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Cors;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System;
 using System.Drawing;
@@ -27,7 +29,22 @@ namespace GHelper
                 Logger.WriteLine("Starting RGB Keyboard API...");
 
                 var builder = WebApplication.CreateBuilder();
+
+                // Add CORS services
+                builder.Services.AddCors(options =>
+                {
+                    options.AddDefaultPolicy(policy =>
+                    {
+                        policy.AllowAnyOrigin()
+                              .AllowAnyHeader()
+                              .AllowAnyMethod();
+                    });
+                });
+
                 var app = builder.Build();
+
+                // Enable CORS
+                app.UseCors();
 
                 app.MapGet("/", () => "TUF RGB Keyboard API is running. Use /set-rgb?r=255&g=0&b=0 to set colors.");
 
@@ -73,7 +90,7 @@ namespace GHelper
                             message = ex.Message
                         });
                     }
-                });
+                }).RequireCors(builder => builder.AllowAnyOrigin());
 
                 host = app;
                 await app.RunAsync($"http://localhost:{ApiPort}");
