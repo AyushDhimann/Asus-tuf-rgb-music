@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Audio-to-RGB Converter",
+  "version": "1.0",
+  "description": "Captures tab audio and converts it to RGB colors based on decibel levels",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://localhost:*/"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/podcast16.png",
+      "64": "images/podcast64.png",
+      "128": "images/podcast128.png"
+    }
+  },
+  "icons": {
+    "16": "images/podcast16.png",
+    "64": "images/podcast64.png",
+    "128": "images/podcast128.png"
+  }
+}

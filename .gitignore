@@ -121,6 +121,9 @@ ipch/
 # Visual Studio Trace Files
 *.e2e
 
+# Jetbrains WebStorm Files
+.idea/
+
 # TFS 2012 Local Workspace
 $tf/
 

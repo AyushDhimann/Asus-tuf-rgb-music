@@ -1,0 +1,1147 @@
+
+
+--- Disco\background.js ---
+
+// Background Service Worker for Audio-to-RGB Converter
+
+// Global variables
+let isCapturing = false;
+let targetTabId = null;
+let processingInterval = null;
+
+// Listen for messages from popup or injected scripts
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  console.log('Background received message:', message);
+  
+  switch(message.action) {
+    case 'startCapture':
+      startCapture(message.tabId)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true; // Keep message channel open for async response
+      
+    case 'stopCapture':
+      stopCapture()
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+      
+    case 'getStatus':
+      sendResponse({
+        isCapturing,
+        targetTabId
+      });
+      break;
+      
+    case 'audioData':
+      // Forward audio data to the API
+      if (message.data && isCapturing) {
+        const { frequency, rgb } = message.data;
+        sendRGBToLocalAPI(rgb.r, rgb.g, rgb.b);
+        // Store the data for the popup to retrieve
+        chrome.storage.local.set({
+          currentFrequency: frequency,
+          currentRGB: rgb,
+          lastUpdated: Date.now()
+        });
+      }
+      sendResponse({ success: true });
+      break;
+      
+    case 'captureEnded':
+      console.log('Capture ended in tab');
+      stopCapture();
+      sendResponse({ success: true });
+      break;
+  }
+});
+
+// Start audio capture
+async function startCapture(tabId) {
+  console.log('Starting capture on tab:', tabId);
+  
+  try {
+    // If already capturing, stop first
+    if (isCapturing) {
+      await stopCapture();
+    }
+    
+    // Store target tab ID
+    targetTabId = tabId;
+    
+    // Inject the content script to capture audio
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-script.js']
+    });
+    
+    console.log('Content script injected into tab', tabId);
+    
+    // Tell the content script to start capturing
+    await chrome.tabs.sendMessage(tabId, { action: 'startCapture' });
+    
+    // Start monitoring for audio data
+    startMonitoring();
+    
+    // Mark as capturing
+    isCapturing = true;
+    
+    // Update badge to indicate active capture
+    chrome.action.setBadgeText({ text: 'ON' });
+    chrome.action.setBadgeBackgroundColor({ color: '#4CAF50' });
+    
+    // Store status
+    chrome.storage.local.set({
+      isCapturing,
+      targetTabId,
+      captureStartTime: Date.now()
+    });
+    
+    return { success: true };
+  } catch (error) {
+    console.error('Error starting capture:', error);
+    await stopCapture();
+    return { success: false, error: error.message };
+  }
+}
+
+// Stop audio capture
+async function stopCapture() {
+  console.log('Stopping capture');
+  
+  // Clear monitoring interval
+  if (processingInterval) {
+    clearInterval(processingInterval);
+    processingInterval = null;
+  }
+  
+  // Tell content script to stop if tab still exists
+  if (targetTabId) {
+    try {
+      await chrome.tabs.sendMessage(targetTabId, { action: 'stopCapture' })
+        .catch(() => console.log('Tab may be closed or unresponsive'));
+    } catch (err) {
+      console.log('Could not send stop message to tab:', err);
+    }
+  }
+  
+  // Reset state
+  isCapturing = false;
+  targetTabId = null;
+  
+  // Update badge
+  chrome.action.setBadgeText({ text: '' });
+  
+  // Store status
+  chrome.storage.local.set({
+    isCapturing,
+    targetTabId: null
+  });
+  
+  // Send black RGB as final value
+  sendRGBToLocalAPI(0, 0, 0);
+  
+  return { success: true };
+}
+
+// Start monitoring for audio data
+function startMonitoring() {
+  if (processingInterval) {
+    clearInterval(processingInterval);
+  }
+  
+  processingInterval = setInterval(() => {
+    if (isCapturing && targetTabId) {
+      try {
+        // Request audio data from content script
+        chrome.tabs.sendMessage(targetTabId, { action: 'processAudio' })
+          .catch(err => {
+            console.error('Error requesting audio data:', err);
+            // Tab might be closed or navigated away
+            if (err.message.includes('Could not establish connection') ||
+                err.message.includes('The message port closed')) {
+              stopCapture();
+            }
+          });
+      } catch (err) {
+        console.error('Error in monitoring interval:', err);
+      }
+    }
+  }, 100); // Every 100ms
+}
+
+// Send RGB values to local API
+async function sendRGBToLocalAPI(r, g, b) {
+  try {
+    const response = await fetch(`http://localhost:7890/set-rgb?r=${r}&g=${g}&b=${b}`);
+    if (!response.ok) {
+      console.warn(`API request failed: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Error sending to API:", error);
+  }
+}
+
+// Handle tab close events
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === targetTabId) {
+    console.log('Target tab was closed');
+    stopCapture();
+  }
+});
+
+// Restore state on service worker startup
+chrome.storage.local.get(['isCapturing', 'targetTabId'], async (data) => {
+  if (data.isCapturing && data.targetTabId) {
+    // Verify tab still exists
+    try {
+      const tab = await chrome.tabs.get(data.targetTabId);
+      if (tab) {
+        console.log('Restoring capture for tab:', tab.id);
+        startCapture(tab.id);
+      }
+    } catch (err) {
+      console.log('Previously captured tab no longer exists');
+    }
+  }
+});
+
+--- Disco\content-script.js ---
+
+// Content script for capturing audio from a web page
+console.log('Audio capture content script loaded');
+
+// Prevent duplicate injections
+if (window.audioCapturerInjected) {
+  console.log('Audio capturer already injected, skipping');
+} else {
+  window.audioCapturerInjected = true;
+
+  // Global variables
+  let stream = null;
+  let audioContext = null;
+  let analyser = null;
+  let isCapturing = false;
+
+  // Listen for messages from background script
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    console.log('Content script received message:', message.action);
+    
+    switch (message.action) {
+      case 'startCapture':
+        setupAudioCapture()
+          .then(() => sendResponse({ success: true }))
+          .catch(err => sendResponse({ success: false, error: err.message }));
+        return true;
+        
+      case 'stopCapture':
+        stopCapture()
+          .then(() => sendResponse({ success: true }))
+          .catch(err => sendResponse({ success: false, error: err.message }));
+        return true;
+        
+      case 'processAudio':
+        const data = processAudio();
+        if (data) {
+          chrome.runtime.sendMessage({
+            action: 'audioData',
+            data
+          });
+        }
+        sendResponse({ success: true });
+        break;
+    }
+  });
+
+  // Set up audio capture
+  async function setupAudioCapture() {
+    try {
+      console.log('Setting up audio capture');
+      
+      // Stop existing capture if any
+      if (isCapturing) {
+        await stopCapture();
+      }
+      
+      // Get display media with audio
+      const displayMediaOptions = {
+        video: {
+          displaySurface: 'browser',
+          width: 1,
+          height: 1,
+          frameRate: 1
+        },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        },
+        selfBrowserSurface: 'include',
+        preferCurrentTab: true
+      };
+      
+      stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
+      
+      // Check if audio track was obtained
+      if (stream.getAudioTracks().length === 0) {
+        throw new Error('No audio track available. Make sure "Share audio" is checked.');
+      }
+      
+      // Set up audio processing
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      
+      // Mark as capturing
+      isCapturing = true;
+      
+      // Handle stream ending
+      stream.getAudioTracks()[0].onended = () => {
+        console.log('Audio track ended');
+        stopCapture().then(() => {
+          chrome.runtime.sendMessage({ action: 'captureEnded' });
+        });
+      };
+      
+      console.log('Audio capture set up successfully');
+      return true;
+    } catch (error) {
+      console.error('Error setting up audio capture:', error);
+      await stopCapture();
+      throw error;
+    }
+  }
+
+  // Stop audio capture
+  async function stopCapture() {
+    console.log('Stopping audio capture');
+    
+    try {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      if (audioContext) {
+        await audioContext.close();
+        audioContext = null;
+      }
+      
+      analyser = null;
+      isCapturing = false;
+      
+      console.log('Audio capture stopped successfully');
+      return true;
+    } catch (error) {
+      console.error('Error stopping audio capture:', error);
+      throw error;
+    }
+  }
+
+  // Process audio data
+  function processAudio() {
+    if (!isCapturing || !analyser || !audioContext) return null;
+    
+    try {
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      analyser.getByteFrequencyData(dataArray);
+      
+      // Find dominant frequency
+      let maxValue = 0;
+      let maxIndex = 0;
+      
+      for (let i = 0; i < bufferLength; i++) {
+        if (dataArray[i] > maxValue) {
+          maxValue = dataArray[i];
+          maxIndex = i;
+        }
+      }
+      
+      // Skip if no significant audio
+      if (maxValue < 10) return null;
+      
+      // Convert index to frequency
+      const frequency = maxIndex * audioContext.sampleRate / analyser.fftSize;
+      
+      // Only process if we have a meaningful frequency
+      if (frequency > 20) {
+        // Convert to RGB using di Pasquale's method
+        const rgb = frequencyToRGB(frequency);
+        
+        return { frequency, rgb };
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error processing audio:', error);
+      return null;
+    }
+  }
+
+  // Convert frequency to RGB using di Pasquale's method
+  function frequencyToRGB(frequency) {
+    // Speed of light in nm/s
+    const speedOfLight = 299792458000000000;
+    
+    // Calculate wavelength in nm using the formula
+    const wavelength = speedOfLight / frequency;
+    
+    // Convert wavelength to RGB
+    return wavelengthToRGB(wavelength);
+  }
+
+  // Convert wavelength to RGB color
+  function wavelengthToRGB(wavelength) {
+    let r, g, b;
+    
+    if (wavelength >= 380 && wavelength < 440) {
+      r = -1 * (wavelength - 440) / (440 - 380);
+      g = 0;
+      b = 1;
+    } else if (wavelength >= 440 && wavelength < 490) {
+      r = 0;
+      g = (wavelength - 440) / (490 - 440);
+      b = 1;
+    } else if (wavelength >= 490 && wavelength < 510) {
+      r = 0;
+      g = 1;
+      b = -1 * (wavelength - 510) / (510 - 490);
+    } else if (wavelength >= 510 && wavelength < 580) {
+      r = (wavelength - 510) / (580 - 510);
+      g = 1;
+      b = 0;
+    } else if (wavelength >= 580 && wavelength < 645) {
+      r = 1;
+      g = -1 * (wavelength - 645) / (645 - 580);
+      b = 0;
+    } else if (wavelength >= 645 && wavelength <= 780) {
+      r = 1;
+      g = 0;
+      b = 0;
+    } else {
+      r = 0;
+      g = 0;
+      b = 0;
+    }
+    
+    // Intensity adjustment
+    let factor;
+    if (wavelength >= 380 && wavelength < 420) {
+      factor = 0.3 + 0.7 * (wavelength - 380) / (420 - 380);
+    } else if (wavelength >= 420 && wavelength < 700) {
+      factor = 1.0;
+    } else if (wavelength >= 700 && wavelength <= 780) {
+      factor = 0.3 + 0.7 * (780 - wavelength) / (780 - 700);
+    } else {
+      factor = 0;
+    }
+    
+    // Convert to 0-255 range
+    r = Math.round(r * factor * 255);
+    g = Math.round(g * factor * 255);
+    b = Math.round(b * factor * 255);
+    
+    return { r, g, b };
+  }
+
+  console.log('Audio capture content script initialization complete');
+}
+
+--- Disco\images\podcast128.png ---
+
+�PNG
+
+   IHDR   �   �   �>a�   sBIT|d�   	pHYs  �  ����I   tEXtSoftware www.inkscape.org��<    IDATx��}y�U���TUwOϚ�	����'D6��I�QY��D|.��Q��+��J���&@� a}��N��=d�l����|���=�TO�$ߙϝ�[U}�9�{����!]���FɤF�bG94��(;l&���  �d7�7 � r! |ʥ�8Kvˮ^1y�dg���$ۚ����q�$��8��X�. 9���{ (�O���/��a��>��ێY���@*@[��w_8\ SH|�nL,v�?2��v�[�E����Xܶ�H{`%��@)���/�C�$gؽ ��	~o?�
+�yB���ێyi ���`�ߨ��;φ� �*	����_�
+t�nI�ڶpbw�&H?�v� ����;�:�I��`{����;���m�|vs�%N?�v� ��k��p*��( l��9�R�7~�����ꗄ�'�n`�$��/=���� � �����?��qs a?$[ʹ](����>؀\K����~�������o;��Ƥ�����x��M��_+�e�� ~���?���+��?���t�����8���s+��^� ��?��+�3��OY����;mu (7N]�M�$�
+�o"��rR^��@6
+�n�U��@j=a�h(��:�=	6�x�_�CO�U�՟�q�M����i�*���ڇ��[I�K�~��!|��GA,��<w��Cjꮽr�í*�AB|��# H��G������-3��xd������ ��[:RL,"8����x)����߿3�΁���>ޔJ�`
+ɓ@$�	|���#k����O^9�r��U�����ܩ��>B��)I�9Р���/�׬j�*�Y���\�D�p�3��?����a�`���Gѐ;	�����}b��n<���j�mʢ�m�0���w��jG��~��S_H�TfO_6Q��	�k��&��O����$ϵҥ��wO��]�g3��|߿�O���I��� 7|e��r���J��]8w�s��@���p�x*�#�_@�������Ղ�O�� ^���࠾���T�q�n]��&:|<Q.;��3U�s ;�|��a�a��������~W��ӗ�V�1��5����Z<��ƿ���m�t�}Õٛ ��A $ߵ���k�;�ɛџ���+/��#5�oC��u���� p��ϮM����
+~����p��������?y�70o���� xt�_Iq&ϸ��'���푾3����_A�T��:ѽ����k4��`�ԥ����}_��z�E7����	��Ӟ�e2�&��`6(� �ک@�MT�p���׭�>k|v ���iw��� ��|����������K�(����G�x��ه�����h�k����nf�éz=R��ms/a�\⒁?���M�E��?�k�������1����
+|ןU��_x�S��Q��p����a=ObX��I2q��~�O�	��Fc���E�,*N#��2 W ? �������Ɩ���u��y�qG���U���W؉����O�T5+���#prr�?c�~z���5M���퍖�ӡ���N��_�s����^�`��o�8�k�ą���C$'T��(z����Z�IfO[z
+�}���#u�%7NX�׸�}���-��)��
+͙�ߕ� ���ƬK\]��w&�kI�xT�q���y��g��׸�� �O{��d���nU��wK����o�5�YS��(0~C��A��V?�Wp�Pf\1����*�7N���c�FF��-�ۛ��v�E����~ ���� ~U?�W�w�K�gOk�] ���g�p���{��vʂA}��{&�'�'�>@`t�h��/q}� ����#�- 2�p���tC_�������0���"�m@�p���}껟q��	�!��k��Eg�[m|}� ��j�����?{Z�t��� |��ա���O[p^_d���/^Ob^�@#$se_��\?�����o fd���k*{�E�R���ӗ~�O
+��V�@��F�~�-#�h��7a�=}w�ο�]=O6� �v�ymֿ׉��7�W:�Iٕ��{��O���s߭V�i��X��s GE �O���`�?�Λ���Xr�gT��A�gg�9pQ5��9S_�5EgD���}��u�A0�FAx��r��zfg�x~5^|�M�~ccE��w䯯Ypz�e��N���
+y0"�n�����sޅ��S�\?m�B�Lz�?� o�p��I�� 7N[v%��E�qx�?��4��8I��箮Y~k���K�quWy�{���o�~Xm|夛�qj$��)˱G�z`z䁴*� ��j�'��8�fuq ��.�j$����p¥c�� 0r�0e������!E,Q�z�3N�K�V���o��b�>�eM��x"[�?��bCOB��| ��s��r2g�cU�>�F9��ę�a��k �/|����7>�v���[A��k����դǴ�n��G �����s���/���(��N�s�
+|n���Q���_Ҫ������������/�/��$�s˅'ݶS5i�Ț��1"� �R��81j�Urv�C��L�5>�@E[�_I��d�'��F�]z^��߿�ܷ��=-����?���EN�k��Y��ܤ���QÏ����xD!��|�"ƵQ� ��W.��Se�1��V|dܶ�����2�r(�����Uό��� �kHvy\�����)G��%�H
+`�� �����j��o�ڲ�P���-#�0��t[���w	��RPh)�ݫ�'�?gx��p݂�;27�˴�H-�h��<�
+�s�
+ ���s
+�Vj珟�f�z� ̘��9�u�-�4���4����s"��^E�%܊
+p��gZH�"@y�	,��O?U�9�4�ę��o݄֏6c{ �6f��h��`�ܲ
+JE�g���'ް{��	��E�?OH{$��'?���'X�** �<��-��9�P `��.I���ב;�/t����D��O�8�d:��ku���cT�V�)F�m�-	+�NZ)Ċ
+���� ��a�U��}y'gU?�hb�-�~�=� �8MIl�l���uA�y��P��3��~��)�O��[�&T%�8�JaV��Ǹ�����/�����
+�H�l�r�Ď{7�*�k� l�-��| 0b&�� ������F��w��Ĉ�d��p� �E���Ay*� �=�_C��>�|4�0 ��/V�/��T+�=�9M��D�l�)E�0*�������Y�Nas��wk� �gWH�|,v�)��́������QY0�uc���%��r���%�A�[	|��c2�]��we��,2�W�_�'�?2<�봓A�ݝ������@v��G#���{�r�/�|�̪y3=1
+�$�8,��B_�W]N1�]�2aT>�qp�;"�d�r�y��*N,�T��,�_@Y�ݴ4t�r�U G��#��}��C�D�QQ�'�xҬ| Hk�EȐ��'�d}]�����������\���/XCp�fl�}W ���> �U��=SO𿢀O���+��0j���{�2���8!�9a�'�N""�|5�$``�ra�U c"�
+^�*@�1ƓLD� ^ybM�����L�� �?�\���52�* VC�h�0�j$�]��Z �ԋ�6x��]"�@D޺� �V ����+�~c�+,W��4C[h��3������z}6lN�q
+�4 ��O���uq��=$ ݽ�����x$�(�Z|7&�(�V�T�W>;$o�g�A������{9����U�mF�N�r5?�\.|suFI�c����'��_�������%H����|ee�8C�ϷS��:��5n ������E������
+��`�����' ��?�=��$��AM�)f �߸������wcǡɚ��w�vacW����J�\��"��4��LI��� �P�#"� �T�M@�
+@��tzGP|���{�V� ����8�3AB��U��Jt����u<��]$�|�}��C���:���b�����r�ʛci�a{���� ���X*��
+�6�$h�� l+y�7��j�'*������4[�WO)���%A޵2�ջ�u	�n��;�O�WBuy������W4I��8r�d�� ��' :��.� �)qהU$h�"/�Vj� �����-Mq(Uבn�2�w_�k/N�=(l=�$��X���)j|5ث`��3�B���䍼�O}���;Ճ(���R2��@U�pE@O��ȫS�
+|7��4 S S�A�� n�hHX�>m�CC�	C�iԄ q�4�g#ܝ��p
+A���xT�:藍�O ��D��J�`gA�>@$�6$ d�@jW5��D�I/����{*��e0 ������E��ф�[��J�n3�j�N�}�$��������x�� ��\95�.)vLR�^Е��-�K�"@�v�fT���J@�� �-Հ���v�����j3��v�(pՂ��cAjJ`PS"��X�F]x"�J����g.��=9�oxm�IĢ���^I�\��-�
+>I�f�>*�$7G� �?vdQ0��,���G8��	��|� �֏B9�P�����
+�[Q1Jn�SRbivD �,FD@!�DēV�����?��dC�(�0\��)@�4�X;F� �"�J�U�d�#*����%� "�J�	B�Ьz� t���f�o��> �Y����~�K�I(4�`��%*��E7��+� �̟�C`S�]��sTl��*ԛ0���;*�?�������'��!e� �N�|X���߇�߳��D�ST�lZ����V%+��oW|��*�2�o��k��s~.��nx�|~������MW�4�RC,�S �Y@�AQ�*s ���Hgtn� �h�l �jwκ���p{( ���.�C��g*�gD�A�ra�U o�W	| �`\T.�嘥m_x`5�M�s��F/��/=�6vi������D  C0j�F|dDcќ�Q4�=	dp�4�o�܌�������+���O,C:��ڬ����|ɫX}ϣ�U���I%�I��
+ �W4�v-	�������q�ST�\x8���਍�z+g1�q���]����5��?�`Z"��' ����6��͕�a �y�,�n߬ 5Tᤗ�=�E�.��H�
+#@[[���q�|7]�ӗ� �%� >|������2��zr��~��t�����d��j7-�.`2�K׿�+(@�2<үP�ې�3�p����ng�jN�rY�<��Y���/>޲��l�>A²R�U��^bX�"����rMzR�U��OA��t9/g�,�����fv �7Nã��o���8/ ?�V pKp�P&rB�^�>�@I��тC�n?�k1܈2��(i ��p��kM��>f)� e���ji'�.��6�:�����Qǝ�F�M~:� �����J�I[m�� ��7a�	&N����������d�D]�D}�B]�t]�D]�@"f 3�hH��|hJ�aLÀ���Z�7� ����x����%�l$T�Ģ�.�����c�WZ}+��5�M$6w�e��+� m����y�Q�F��ylJ���J��>o�<�\�����l�p�U2W�|%��g����ƻ����dh� a���ƘE	��"C�M�r��:��e�&a�*�J	F��t�I��)��H�1��h����\4-F��~N�����mv�0+.��O9p��ʳ����/������:G�k?���|W)lǁ�h�#p����LS ��#-ÀihL�1bh=C��� 26a{id ���@m�
+a�ƌ�დ��[��L��b11�D"n!7���H$���q�pkЫ?��6C�S��ڥe�q&�Y�>
+/S�3�)�-�{�0+� �������(yy(��!S�%���(�->���ěgg���W�"d�ǎ��g�x�
+b�͸M{���L$-�[5��,#wj����O�-�^�?�*(tG,���>��R�3��_�n>� ��fE0�%t�
+}�}G]����g�|�ܺJ����RU7��{������s'���*�����7��V�8c�N=�3��}�>���͝٦��d��&M�:	��\�����	'ns�����>`��Ɏ
+�pT]`���5�vP��Ӗ!C�U�Y�w�Y�5n�Y�>`{�J�2���k����]|�L���<���C?TF�'���� �:��l������~ePT.�%�h[Ĩ��U7ǫ:P�lV�ઞ%�ة�E f�s^�!�[��gQ�q /�ܬ���_z�rM���O t�t���s���ރ��l�ȒO�em��~��E2a(�E	4��hط�T=H�V��A0������Sn;���fl��Qǫ��V�Vo���
+~������~ЗQX��j��S���gH�����F�c� �w�6?Jؑ����{`���s���l?�z¦���\^���o�CI��G��A}�Q���+���,:{���9���۽f�������ݩ,�z��N��+|����q�o�V"㎇�Y�r&[�G���^�w{B�^���Y�N�t�U�b�}���7�:fA�����3b����3��%\>w��o�8���ȍ>`4v9��2�B�����^C1�%�L[���&�n���4�g=6�r����),]ށ�����y�%��T�8b�C��l-�vI�x�U�Q��U;?����^+�����F	?�?���G�0�t�p���5p6����A�WE�翵q�'-�L��j��>�������]C��V<�t6��*f��2���?�ҝ��KW�;����;a� ʢg]۬��*��*~�AG2s9�k��o�L}-*�@������W�x6�ʡW�+�Td�츩�~�\��xpG'?G2 ����w�G��u��Es}M��-4&ch��Аt]}����{M$L�\�N��|�G���^�	`Zn�(���C :��Jc��_� � �::y��.\������? ׵4&rR����*$�NZ���uAW0�.Ⱏ=?�Hg3��n)����-�"Ŀ �}}���v��O�7O1�p�*�chhp�!i�1i�JPg���D2i"�p��h��G�z@Oʆa0��y4����E^��~������?�vk��=��_�;YtC��?��f:�Q���퓄��z������Z���o�Xb��5���̾�*�~�@E�NK��(�C�Bw�H�ё[s�C3��k9�ӵ��zf?��:u�������P2f��S����c�Xm?����g�[��p���6��Ï��M��`3��=��N-Ƈ�m����9��u�z�!|���i  �nQ���U}hT���
+lT��P@;�P: �g=N�s�}f��E���H��V������5X��ǌX��7"'0D`�qG�Ӏ�g���;���0���ȝ�!b����$���&��\��U)r�C�������׊��>~��
+=���P{��y�����oQU��\��t�L�A��M���r[�U�8�i�:�W`a�J t��\���������`4�< B�΢X��ȝ���^U
+��d"������X��_�8��r����aс�<���$	���
+�\�\�D亨M�0U*F�$f���2�V{�/@o9��#
+�(ZW.B?���8l}C��!�j�����4}��ܘ����±50�y?}}�'v}�.�Z4��lE��O�{?�ȟG���^�����E#�@}:7�m��LҊ_B���p����F��8����Wr�b9��b��ᦗ)�ڸi�;L\���@�>�4`�b��
+���e���V�g�O�>quR�C��C�+$�;�L�v����!�5;���7�-�!  
+�IDAT%���AS��HPU�snK��M���p����L��(�O�Q,���V���z�`�b�-VXf�ڌ麮]şD�g�}WPv����g�Iـ  �NC��Π�!��q��a��Alɫ�(����,�|D��\�[*ΈT|�My2+���06<��;����	&{N2����H�0���Ӭ;�|����������g��p�+k'C�ҁ=x9��ZM���S�V�F.�� 2�2�Mj ��g-y3�%Q(�%c��(B��E��S�y�a�I �O�.�ޤc��ܕ��h������+Hce@�x�0�tVWP�cTC�za��)�x�[� oN�!@����
+"�7�?����}��nv�H���Y�a��T� �������J;ٲK��1y~��/��M���_��Z|��Y�!��mQ�[��_���C����o����Q�$�-��ƠK�� �-�����~�ڞ��T��U-������`����x�ߥ�yDm�����mٜ_�]�����!3.E�$yH^�&�mS��� �b���xu�,�������Au-W�]���սÿ9/X��N�$L��Q��յ��"�Ud�������l�e���!g���oC����0����ڣG7�R ���B�٩�`�]�W ����Gg>T8e��  �����kI�<Y�}Z�ygى	,�l[�ڈ^�MDC��d�32.�q���t�{�u��\�}���-�������k$�ބ#	4��*����(w��?�V�9C�_  n��5ś��F�:�5���}*�L!���ŢzV��ve33�Y�d���]F��(Ҟ"�.�q� �|���ﲽ�Zg�N��6ۊɠ�g�u��7}��#t4��z��C���_��0�� ���hWk|��۬����m�A�;�"�������?6�D̼��W���H�2�)�����%����Z�aZ7>������L򹐵�ڒł�7ꘓK$�[�w�H����4 
+ ̚5=��c�c��
+߉���p��Πg�hLg��b�:#}U�t�36r.�L�F���{�����y.ӏN�km{KQ�3Y��DCn"/��g��5��w�ۗ��(4 
+  N��l�IZɠC$a&���zY�b������^[�^N�I�5՝n�� ��e�D�ιL	�j��b7'�N�<�#������#�����&nH��R�� R���<�����|�J�'���hL>��o@��K�j���¼ޡ� 8!�o5��r�o�k݅����*k�֦�O�[�����������9�ȗ|��5�8�طt}�����!=>��_���VP�h�b=�W���MP(�.E���d��wWm������6d���ϜrXk����r��B.��9`�P��'�@�v�  �|��K�\z�!"|t��S�����=����ߧ�v�thUK��e�k���C��-�����U���?��{5��)WmW
+о��1�s �;��d�r�CdS��,xb���\��{���ҥ!��_Z_쩇z���76p���$�s�x5C9(J�ok�v�  �|P�?�W�æ�P.�nr�W6lJ]�as:��}�榺�����8a����yy-���'C�SP9d�Vyq ����; �ek�e�A>O���0zG)����O����'sYWW�c]=v�e�娡>��X��������ܷ������ �O�����0��č���R `�~`�ʢ7C>��0���eޣw��x㋯,���du��<~�7����D:��.��ѱ��Ӿs'jPѡ�BZ����ɿ����򝱭�(alm�n  �W;m"�����@�c7~��HŅz&L�r��7}�i�0#p>��ӹ�}����A����g�� ˗3���� ��;��n����ۆ�#�?h�V�M���z��qW`��ؾ�>�,�`c�|gYV�L���� &y<�����,]m��iїH��@,��㐸`{��  ����N�ǒX��>�؛*w��������,�(~�a����B[��"�R��ln_c��t����$�,�mT?�O�YtE��Dۤ�\-�m�=�t-p� �	�Ǒ2'e�uKV�"5��Wǋd}���	� ���`�2xg�2�\�=i�9:e��=뗐�2m�f�L�hڮ� ����)�\`�
+�� V�vf�+K���S�P�0�����ǘq=_W�l��*V�,+^<n�U�����N �����P�@.��dԭIī^�a�2^d@F��>�
+�I����,� h�JQo���?}l����!�}� L�Hs�U8�#I����F���A:�I�U^ ��/��&��8v�E(E'�tR+�X%b�� �m�'�ٶ�l6�t:��Ɔ����G�|��
+��R�M�?�9���c�6�	��,��,2���m5ʼ��C� �i�4�^�߯��(C!���3}���,� �ND�@�o �GP�'��@�
+��)�~p�0L�g>dY���S����	
+�ݏ�J���,��_|�2���)�����:E�)S��R�ygg��m��֤�,^���f��3M3���^yc�8}������A"��x�Ƈ��#��/��3��P�4��q�a���?�{"r>"�I&�?��_`����P  �7o�m"2@�9��d2����z�[��mM�y��ҥK�w�}���i$��j��:$W��(�H��x���C�����w� ��s    IEND�B`�
+
+--- Disco\images\podcast128_green.png ---
+
+�PNG
+
+   IHDR   �   �   �>a�   sBIT|d�   	pHYs  �  ����I   tEXtSoftware www.inkscape.org��<    IDATx��}y�U���TUwOϚ�	����'D6��I�QY��D|.��Q��+��J���&@� a}��N��=d�l����|���=�TO�$ߙϝ�[U}�9�{����!]���FɤF�bG94��(;l&���  �d7�7 � r! |ʥ�8Kvˮ^1y�dg���$ۚ����q�$��8��X�. 9���{ (�O���/��a��>��ێY���@*@[��w_8\ SH|�nL,v�?2��v�[�E����Xܶ�H{`%��@)���/�C�$gؽ ��	~o?�
+�yB���ێyi ���`�ߨ��;φ� �*	����_�
+t�nI�ڶpbw�&H?�v� ����;�:�I��`{����;���m�|vs�%N?�v� ��k��p*��( l��9�R�7~�����ꗄ�'�n`�$��/=���� � �����?��qs a?$[ʹ](����>؀\K����~�������o;��Ƥ�����x��M��_+�e�� ~���?���+��?���t�����8���s+��^� ��?��+�3��OY����;mu (7N]�M�$�
+�o"��rR^��@6
+�n�U��@j=a�h(��:�=	6�x�_�CO�U�՟�q�M����i�*���ڇ��[I�K�~��!|��GA,��<w��Cjꮽr�í*�AB|��# H��G������-3��xd������ ��[:RL,"8����x)����߿3�΁���>ޔJ�`
+ɓ@$�	|���#k����O^9�r��U�����ܩ��>B��)I�9Р���/�׬j�*�Y���\�D�p�3��?����a�`���Gѐ;	�����}b��n<���j�mʢ�m�0���w��jG��~��S_H�TfO_6Q��	�k��&��O����$ϵҥ��wO��]�g3��|߿�O���I��� 7|e��r���J��]8w�s��@���p�x*�#�_@�������Ղ�O�� ^���࠾���T�q�n]��&:|<Q.;��3U�s ;�|��a�a��������~W��ӗ�V�1��5����Z<��ƿ���m�t�}Õٛ ��A $ߵ���k�;�ɛџ���+/��#5�oC��u���� p��ϮM����
+~����p��������?y�70o���� xt�_Iq&ϸ��'���푾3����_A�T��:ѽ����k4��`�ԥ����}_��z�E7����	��Ӟ�e2�&��`6(� �ک@�MT�p���׭�>k|v ���iw��� ��|����������K�(����G�x��ه�����h�k����nf�éz=R��ms/a�\⒁?���M�E��?�k�������1����
+|ןU��_x�S��Q��p����a=ObX��I2q��~�O�	��Fc���E�,*N#��2 W ? �������Ɩ���u��y�qG���U���W؉����O�T5+���#prr�?c�~z���5M���퍖�ӡ���N��_�s����^�`��o�8�k�ą���C$'T��(z����Z�IfO[z
+�}���#u�%7NX�׸�}���-��)��
+͙�ߕ� ���ƬK\]��w&�kI�xT�q���y��g��׸�� �O{��d���nU��wK����o�5�YS��(0~C��A��V?�Wp�Pf\1����*�7N���c�FF��-�ۛ��v�E����~ ���� ~U?�W�w�K�gOk�] ���g�p���{��vʂA}��{&�'�'�>@`t�h��/q}� ����#�- 2�p���tC_�������0���"�m@�p���}껟q��	�!��k��Eg�[m|}� ��j�����?{Z�t��� |��ա���O[p^_d���/^Ob^�@#$se_��\?�����o fd���k*{�E�R���ӗ~�O
+��V�@��F�~�-#�h��7a�=}w�ο�]=O6� �v�ymֿ׉��7�W:�Iٕ��{��O���s߭V�i��X��s GE �O���`�?�Λ���Xr�gT��A�gg�9pQ5��9S_�5EgD���}��u�A0�FAx��r��zfg�x~5^|�M�~ccE��w䯯Ypz�e��N���
+y0"�n�����sޅ��S�\?m�B�Lz�?� o�p��I�� 7N[v%��E�qx�?��4��8I��箮Y~k���K�quWy�{���o�~Xm|夛�qj$��)˱G�z`z䁴*� ��j�'��8�fuq ��.�j$����p¥c�� 0r�0e������!E,Q�z�3N�K�V���o��b�>�eM��x"[�?��bCOB��| ��s��r2g�cU�>�F9��ę�a��k �/|����7>�v���[A��k����դǴ�n��G �����s���/���(��N�s�
+|n���Q���_Ҫ������������/�/��$�s˅'ݶS5i�Ț��1"� �R��81j�Urv�C��L�5>�@E[�_I��d�'��F�]z^��߿�ܷ��=-����?���EN�k��Y��ܤ���QÏ����xD!��|�"ƵQ� ��W.��Se�1��V|dܶ�����2�r(�����Uό��� �kHvy\�����)G��%�H
+`�� �����j��o�ڲ�P���-#�0��t[���w	��RPh)�ݫ�'�?gx��p݂�;27�˴�H-�h��<�
+�s�
+ ���s
+�Vj珟�f�z� ̘��9�u�-�4���4����s"��^E�%܊
+p��gZH�"@y�	,��O?U�9�4�ę��o݄֏6c{ �6f��h��`�ܲ
+JE�g���'ް{��	��E�?OH{$��'?���'X�** �<��-��9�P `��.I���ב;�/t����D��O�8�d:��ku���cT�V�)F�m�-	+�NZ)Ċ
+���� ��a�U��}y'gU?�hb�-�~�=� �8MIl�l���uA�y��P��3��~��)�O��[�&T%�8�JaV��Ǹ�����/�����
+�H�l�r�Ď{7�*�k� l�-��| 0b&�� ������F��w��Ĉ�d��p� �E���Ay*� �=�_C��>�|4�0 ��/V�/��T+�=�9M��D�l�)E�0*�������Y�Nas��wk� �gWH�|,v�)��́������QY0�uc���%��r���%�A�[	|��c2�]��we��,2�W�_�'�?2<�봓A�ݝ������@v��G#���{�r�/�|�̪y3=1
+�$�8,��B_�W]N1�]�2aT>�qp�;"�d�r�y��*N,�T��,�_@Y�ݴ4t�r�U G��#��}��C�D�QQ�'�xҬ| Hk�EȐ��'�d}]�����������\���/XCp�fl�}W ���> �U��=SO𿢀O���+��0j���{�2���8!�9a�'�N""�|5�$``�ra�U c"�
+^�*@�1ƓLD� ^ybM�����L�� �?�\���52�* VC�h�0�j$�]��Z �ԋ�6x��]"�@D޺� �V ����+�~c�+,W��4C[h��3������z}6lN�q
+�4 ��O���uq��=$ ݽ�����x$�(�Z|7&�(�V�T�W>;$o�g�A������{9����U�mF�N�r5?�\.|suFI�c����'��_�������%H����|ee�8C�ϷS��:��5n ������E������
+��`�����' ��?�=��$��AM�)f �߸������wcǡɚ��w�vacW����J�\��"��4��LI��� �P�#"� �T�M@�
+@��tzGP|���{�V� ����8�3AB��U��Jt����u<��]$�|�}��C���:���b�����r�ʛci�a{���� ���X*��
+�6�$h�� l+y�7��j�'*������4[�WO)���%A޵2�ջ�u	�n��;�O�WBuy������W4I��8r�d�� ��' :��.� �)qהU$h�"/�Vj� �����-Mq(Uבn�2�w_�k/N�=(l=�$��X���)j|5ث`��3�B���䍼�O}���;Ճ(���R2��@U�pE@O��ȫS�
+|7��4 S S�A�� n�hHX�>m�CC�	C�iԄ q�4�g#ܝ��p
+A���xT�:藍�O ��D��J�`gA�>@$�6$ d�@jW5��D�I/����{*��e0 ������E��ф�[��J�n3�j�N�}�$��������x�� ��\95�.)vLR�^Е��-�K�"@�v�fT���J@�� �-Հ���v�����j3��v�(pՂ��cAjJ`PS"��X�F]x"�J����g.��=9�oxm�IĢ���^I�\��-�
+>I�f�>*�$7G� �?vdQ0��,���G8��	��|� �֏B9�P�����
+�[Q1Jn�SRbivD �,FD@!�DēV�����?��dC�(�0\��)@�4�X;F� �"�J�U�d�#*����%� "�J�	B�Ьz� t���f�o��> �Y����~�K�I(4�`��%*��E7��+� �̟�C`S�]��sTl��*ԛ0���;*�?�������'��!e� �N�|X���߇�߳��D�ST�lZ����V%+��oW|��*�2�o��k��s~.��nx�|~������MW�4�RC,�S �Y@�AQ�*s ���Hgtn� �h�l �jwκ���p{( ���.�C��g*�gD�A�ra�U o�W	| �`\T.�嘥m_x`5�M�s��F/��/=�6vi������D  C0j�F|dDcќ�Q4�=	dp�4�o�܌�������+���O,C:��ڬ����|ɫX}ϣ�U���I%�I��
+ �W4�v-	�������q�ST�\x8���਍�z+g1�q���]����5��?�`Z"��' ����6��͕�a �y�,�n߬ 5Tᤗ�=�E�.��H�
+#@[[���q�|7]�ӗ� �%� >|������2��zr��~��t�����d��j7-�.`2�K׿�+(@�2<үP�ې�3�p����ng�jN�rY�<��Y���/>޲��l�>A²R�U��^bX�"����rMzR�U��OA��t9/g�,�����fv �7Nã��o���8/ ?�V pKp�P&rB�^�>�@I��тC�n?�k1܈2��(i ��p��kM��>f)� e���ji'�.��6�:�����Qǝ�F�M~:� �����J�I[m�� ��7a�	&N����������d�D]�D}�B]�t]�D]�@"f 3�hH��|hJ�aLÀ���Z�7� ����x����%�l$T�Ģ�.�����c�WZ}+��5�M$6w�e��+� m����y�Q�F��ylJ���J��>o�<�\�����l�p�U2W�|%��g����ƻ����dh� a���ƘE	��"C�M�r��:��e�&a�*�J	F��t�I��)��H�1��h����\4-F��~N�����mv�0+.��O9p��ʳ����/������:G�k?���|W)lǁ�h�#p����LS ��#-ÀihL�1bh=C��� 26a{id ���@m�
+a�ƌ�დ��[��L��b11�D"n!7���H$���q�pkЫ?��6C�S��ڥe�q&�Y�>
+/S�3�)�-�{�0+� �������(yy(��!S�%���(�->���ěgg���W�"d�ǎ��g�x�
+b�͸M{���L$-�[5��,#wj����O�-�^�?�*(tG,���>��R�3��_�n>� ��fE0�%t�
+}�}G]����g�|�ܺJ����RU7��{������s'���*�����7��V�8c�N=�3��}�>���͝٦��d��&M�:	��\�����	'ns�����>`��Ɏ
+�pT]`���5�vP��Ӗ!C�U�Y�w�Y�5n�Y�>`{�J�2���k����]|�L���<���C?TF�'���� �:��l������~ePT.�%�h[Ĩ��U7ǫ:P�lV�ઞ%�ة�E f�s^�!�[��gQ�q /�ܬ���_z�rM���O t�t���s���ރ��l�ȒO�em��~��E2a(�E	4��hط�T=H�V��A0������Sn;���fl��Qǫ��V�Vo���
+~������~ЗQX��j��S���gH�����F�c� �w�6?Jؑ����{`���s���l?�z¦���\^���o�CI��G��A}�Q���+���,:{���9���۽f�������ݩ,�z��N��+|����q�o�V"㎇�Y�r&[�G���^�w{B�^���Y�N�t�U�b�}���7�:fA�����3b����3��%\>w��o�8���ȍ>`4v9��2�B�����^C1�%�L[���&�n���4�g=6�r����),]ށ�����y�%��T�8b�C��l-�vI�x�U�Q��U;?����^+�����F	?�?���G�0�t�p���5p6����A�WE�翵q�'-�L��j��>�������]C��V<�t6��*f��2���?�ҝ��KW�;����;a� ʢg]۬��*��*~�AG2s9�k��o�L}-*�@������W�x6�ʡW�+�Td�츩�~�\��xpG'?G2 ����w�G��u��Es}M��-4&ch��Аt]}����{M$L�\�N��|�G���^�	`Zn�(���C :��Jc��_� � �::y��.\������? ׵4&rR����*$�NZ���uAW0�.Ⱏ=?�Hg3��n)����-�"Ŀ �}}���v��O�7O1�p�*�chhp�!i�1i�JPg���D2i"�p��h��G�z@Oʆa0��y4����E^��~������?�vk��=��_�;YtC��?��f:�Q���퓄��z������Z���o�Xb��5���̾�*�~�@E�NK��(�C�Bw�H�ё[s�C3��k9�ӵ��zf?��:u�������P2f��S����c�Xm?����g�[��p���6��Ï��M��`3��=��N-Ƈ�m����9��u�z�!|���i  �nQ���U}hT���
+lT��P@;�P: �g=N�s�}f��E���H��V������5X��ǌX��7"'0D`�qG�Ӏ�g���;���0���ȝ�!b����$���&��\��U)r�C�������׊��>~��
+=���P{��y�����oQU��\��t�L�A��M���r[�U�8�i�:�W`a�J t��\���������`4�< B�΢X��ȝ���^U
+��d"������X��_�8��r����aс�<���$	���
+�\�\�D亨M�0U*F�$f���2�V{�/@o9��#
+�(ZW.B?���8l}C��!�j�����4}��ܘ����±50�y?}}�'v}�.�Z4��lE��O�{?�ȟG���^�����E#�@}:7�m��LҊ_B���p����F��8����Wr�b9��b��ᦗ)�ڸi�;L\���@�>�4`�b��
+���e���V�g�O�>quR�C��C�+$�;�L�v����!�5;���7�-�!  
+�IDAT%���AS��HPU�snK��M���p����L��(�O�Q,���V���z�`�b�-VXf�ڌ麮]şD�g�}WPv����g�Iـ  �NC��Π�!��q��a��Alɫ�(����,�|D��\�[*ΈT|�My2+���06<��;����	&{N2����H�0���Ӭ;�|����������g��p�+k'C�ҁ=x9��ZM���S�V�F.�� 2�2�Mj ��g-y3�%Q(�%c��(B��E��S�y�a�I �O�.�ޤc��ܕ��h������+Hce@�x�0�tVWP�cTC�za��)�x�[� oN�!@����
+"�7�?����}��nv�H���Y�a��T� �������J;ٲK��1y~��/��M���_��Z|��Y�!��mQ�[��_���C����o����Q�$�-��ƠK�� �-�����~�ڞ��T��U-������`����x�ߥ�yDm�����mٜ_�]�����!3.E�$yH^�&�mS��� �b���xu�,�������Au-W�]���սÿ9/X��N�$L��Q��յ��"�Ud�������l�e���!g���oC����0����ڣG7�R ���B�٩�`�]�W ����Gg>T8e��  �����kI�<Y�}Z�ygى	,�l[�ڈ^�MDC��d�32.�q���t�{�u��\�}���-�������k$�ބ#	4��*����(w��?�V�9C�_  n��5ś��F�:�5���}*�L!���ŢzV��ve33�Y�d���]F��(Ҟ"�.�q� �|���ﲽ�Zg�N��6ۊɠ�g�u��7}��#t4��z��C���_��0�� ���hWk|��۬����m�A�;�"�������?6�D̼��W���H�2�)�����%����Z�aZ7>������L򹐵�ڒł�7ꘓK$�[�w�H����4 
+ ̚5=��c�c��
+߉���p��Πg�hLg��b�:#}U�t�36r.�L�F���{�����y.ӏN�km{KQ�3Y��DCn"/��g��5��w�ۗ��(4 
+  N��l�IZɠC$a&���zY�b������^[�^N�I�5՝n�� ��e�D�ιL	�j��b7'�N�<�#������#�����&nH��R�� R���<�����|�J�'���hL>��o@��K�j���¼ޡ� 8!�o5��r�o�k݅����*k�֦�O�[�����������9�ȗ|��5�8�طt}�����!=>��_���VP�h�b=�W���MP(�.E���d��wWm������6d���ϜrXk����r��B.��9`�P��'�@�v�  �|��K�\z�!"|t��S�����=����ߧ�v�thUK��e�k���C��-�����U���?��{5��)WmW
+о��1�s �;��d�r�CdS��,xb���\��{���ҥ!��_Z_쩇z���76p���$�s�x5C9(J�ok�v�  �|P�?�W�æ�P.�nr�W6lJ]�as:��}�榺�����8a����yy-���'C�SP9d�Vyq ����; �ek�e�A>O���0zG)����O����'sYWW�c]=v�e�娡>��X��������ܷ������ �O�����0��č���R `�~`�ʢ7C>��0���eޣw��x㋯,���du��<~�7����D:��.��ѱ��Ӿs'jPѡ�BZ����ɿ����򝱭�(alm�n  �W;m"�����@�c7~��HŅz&L�r��7}�i�0#p>��ӹ�}����A����g�� ˗3���� ��;��n����ۆ�#�?h�V�M���z��qW`��ؾ�>�,�`c�|gYV�L���� &y<�����,]m��iїH��@,��㐸`{��  ����N�ǒX��>�؛*w��������,�(~�a����B[��"�R��ln_c��t����$�,�mT?�O�YtE��Dۤ�\-�m�=�t-p� �	�Ǒ2'e�uKV�"5��Wǋd}���	� ���`�2xg�2�\�=i�9:e��=뗐�2m�f�L�hڮ� ����)�\`�
+�� V�vf�+K���S�P�0�����ǘq=_W�l��*V�,+^<n�U�����N �����P�@.��dԭIī^�a�2^d@F��>�
+�I����,� h�JQo���?}l����!�}� L�Hs�U8�#I����F���A:�I�U^ ��/��&��8v�E(E'�tR+�X%b�� �m�'�ٶ�l6�t:��Ɔ����G�|��
+��R�M�?�9���c�6�	��,��,2���m5ʼ��C� �i�4�^�߯��(C!���3}���,� �ND�@�o �GP�'��@�
+��)�~p�0L�g>dY���S����	
+�ݏ�J���,��_|�2���)�����:E�)S��R�ygg��m��֤�,^���f��3M3���^yc�8}������A"��x�Ƈ��#��/��3��P�4��q�a���?�{"r>"�I&�?��_`����P  �7o�m"2@�9��d2����z�[��mM�y��ҥK�w�}���i$��j��:$W��(�H��x���C�����w� ��s    IEND�B`�
+
+--- Disco\images\podcast128_yellow.png ---
+
+�PNG
+
+   IHDR   �   �   �>a�   sBIT|d�   	pHYs  �  ����I   tEXtSoftware www.inkscape.org��<    IDATx��}y�U���TUwOϚ�	����'D6��I�QY��D|.��Q��+��J���&@� a}��N��=d�l����|���=�TO�$ߙϝ�[U}�9�{����!]���FɤF�bG94��(;l&���  �d7�7 � r! |ʥ�8Kvˮ^1y�dg���$ۚ����q�$��8��X�. 9���{ (�O���/��a��>��ێY���@*@[��w_8\ SH|�nL,v�?2��v�[�E����Xܶ�H{`%��@)���/�C�$gؽ ��	~o?�
+�yB���ێyi ���`�ߨ��;φ� �*	����_�
+t�nI�ڶpbw�&H?�v� ����;�:�I��`{����;���m�|vs�%N?�v� ��k��p*��( l��9�R�7~�����ꗄ�'�n`�$��/=���� � �����?��qs a?$[ʹ](����>؀\K����~�������o;��Ƥ�����x��M��_+�e�� ~���?���+��?���t�����8���s+��^� ��?��+�3��OY����;mu (7N]�M�$�
+�o"��rR^��@6
+�n�U��@j=a�h(��:�=	6�x�_�CO�U�՟�q�M����i�*���ڇ��[I�K�~��!|��GA,��<w��Cjꮽr�í*�AB|��# H��G������-3��xd������ ��[:RL,"8����x)����߿3�΁���>ޔJ�`
+ɓ@$�	|���#k����O^9�r��U�����ܩ��>B��)I�9Р���/�׬j�*�Y���\�D�p�3��?����a�`���Gѐ;	�����}b��n<���j�mʢ�m�0���w��jG��~��S_H�TfO_6Q��	�k��&��O����$ϵҥ��wO��]�g3��|߿�O���I��� 7|e��r���J��]8w�s��@���p�x*�#�_@�������Ղ�O�� ^���࠾���T�q�n]��&:|<Q.;��3U�s ;�|��a�a��������~W��ӗ�V�1��5����Z<��ƿ���m�t�}Õٛ ��A $ߵ���k�;�ɛџ���+/��#5�oC��u���� p��ϮM����
+~����p��������?y�70o���� xt�_Iq&ϸ��'���푾3����_A�T��:ѽ����k4��`�ԥ����}_��z�E7����	��Ӟ�e2�&��`6(� �ک@�MT�p���׭�>k|v ���iw��� ��|����������K�(����G�x��ه�����h�k����nf�éz=R��ms/a�\⒁?���M�E��?�k�������1����
+|ןU��_x�S��Q��p����a=ObX��I2q��~�O�	��Fc���E�,*N#��2 W ? �������Ɩ���u��y�qG���U���W؉����O�T5+���#prr�?c�~z���5M���퍖�ӡ���N��_�s����^�`��o�8�k�ą���C$'T��(z����Z�IfO[z
+�}���#u�%7NX�׸�}���-��)��
+͙�ߕ� ���ƬK\]��w&�kI�xT�q���y��g��׸�� �O{��d���nU��wK����o�5�YS��(0~C��A��V?�Wp�Pf\1����*�7N���c�FF��-�ۛ��v�E����~ ���� ~U?�W�w�K�gOk�] ���g�p���{��vʂA}��{&�'�'�>@`t�h��/q}� ����#�- 2�p���tC_�������0���"�m@�p���}껟q��	�!��k��Eg�[m|}� ��j�����?{Z�t��� |��ա���O[p^_d���/^Ob^�@#$se_��\?�����o fd���k*{�E�R���ӗ~�O
+��V�@��F�~�-#�h��7a�=}w�ο�]=O6� �v�ymֿ׉��7�W:�Iٕ��{��O���s߭V�i��X��s GE �O���`�?�Λ���Xr�gT��A�gg�9pQ5��9S_�5EgD���}��u�A0�FAx��r��zfg�x~5^|�M�~ccE��w䯯Ypz�e��N���
+y0"�n�����sޅ��S�\?m�B�Lz�?� o�p��I�� 7N[v%��E�qx�?��4��8I��箮Y~k���K�quWy�{���o�~Xm|夛�qj$��)˱G�z`z䁴*� ��j�'��8�fuq ��.�j$����p¥c�� 0r�0e������!E,Q�z�3N�K�V���o��b�>�eM��x"[�?��bCOB��| ��s��r2g�cU�>�F9��ę�a��k �/|����7>�v���[A��k����դǴ�n��G �����s���/���(��N�s�
+|n���Q���_Ҫ������������/�/��$�s˅'ݶS5i�Ț��1"� �R��81j�Urv�C��L�5>�@E[�_I��d�'��F�]z^��߿�ܷ��=-����?���EN�k��Y��ܤ���QÏ����xD!��|�"ƵQ� ��W.��Se�1��V|dܶ�����2�r(�����Uό��� �kHvy\�����)G��%�H
+`�� �����j��o�ڲ�P���-#�0��t[���w	��RPh)�ݫ�'�?gx��p݂�;27�˴�H-�h��<�
+�s�
+ ���s
+�Vj珟�f�z� ̘��9�u�-�4���4����s"��^E�%܊
+p��gZH�"@y�	,��O?U�9�4�ę��o݄֏6c{ �6f��h��`�ܲ
+JE�g���'ް{��	��E�?OH{$��'?���'X�** �<��-��9�P `��.I���ב;�/t����D��O�8�d:��ku���cT�V�)F�m�-	+�NZ)Ċ
+���� ��a�U��}y'gU?�hb�-�~�=� �8MIl�l���uA�y��P��3��~��)�O��[�&T%�8�JaV��Ǹ�����/�����
+�H�l�r�Ď{7�*�k� l�-��| 0b&�� ������F��w��Ĉ�d��p� �E���Ay*� �=�_C��>�|4�0 ��/V�/��T+�=�9M��D�l�)E�0*�������Y�Nas��wk� �gWH�|,v�)��́������QY0�uc���%��r���%�A�[	|��c2�]��we��,2�W�_�'�?2<�봓A�ݝ������@v��G#���{�r�/�|�̪y3=1
+�$�8,��B_�W]N1�]�2aT>�qp�;"�d�r�y��*N,�T��,�_@Y�ݴ4t�r�U G��#��}��C�D�QQ�'�xҬ| Hk�EȐ��'�d}]�����������\���/XCp�fl�}W ���> �U��=SO𿢀O���+��0j���{�2���8!�9a�'�N""�|5�$``�ra�U c"�
+^�*@�1ƓLD� ^ybM�����L�� �?�\���52�* VC�h�0�j$�]��Z �ԋ�6x��]"�@D޺� �V ����+�~c�+,W��4C[h��3������z}6lN�q
+�4 ��O���uq��=$ ݽ�����x$�(�Z|7&�(�V�T�W>;$o�g�A������{9����U�mF�N�r5?�\.|suFI�c����'��_�������%H����|ee�8C�ϷS��:��5n ������E������
+��`�����' ��?�=��$��AM�)f �߸������wcǡɚ��w�vacW����J�\��"��4��LI��� �P�#"� �T�M@�
+@��tzGP|���{�V� ����8�3AB��U��Jt����u<��]$�|�}��C���:���b�����r�ʛci�a{���� ���X*��
+�6�$h�� l+y�7��j�'*������4[�WO)���%A޵2�ջ�u	�n��;�O�WBuy������W4I��8r�d�� ��' :��.� �)qהU$h�"/�Vj� �����-Mq(Uבn�2�w_�k/N�=(l=�$��X���)j|5ث`��3�B���䍼�O}���;Ճ(���R2��@U�pE@O��ȫS�
+|7��4 S S�A�� n�hHX�>m�CC�	C�iԄ q�4�g#ܝ��p
+A���xT�:藍�O ��D��J�`gA�>@$�6$ d�@jW5��D�I/����{*��e0 ������E��ф�[��J�n3�j�N�}�$��������x�� ��\95�.)vLR�^Е��-�K�"@�v�fT���J@�� �-Հ���v�����j3��v�(pՂ��cAjJ`PS"��X�F]x"�J����g.��=9�oxm�IĢ���^I�\��-�
+>I�f�>*�$7G� �?vdQ0��,���G8��	��|� �֏B9�P�����
+�[Q1Jn�SRbivD �,FD@!�DēV�����?��dC�(�0\��)@�4�X;F� �"�J�U�d�#*����%� "�J�	B�Ьz� t���f�o��> �Y����~�K�I(4�`��%*��E7��+� �̟�C`S�]��sTl��*ԛ0���;*�?�������'��!e� �N�|X���߇�߳��D�ST�lZ����V%+��oW|��*�2�o��k��s~.��nx�|~������MW�4�RC,�S �Y@�AQ�*s ���Hgtn� �h�l �jwκ���p{( ���.�C��g*�gD�A�ra�U o�W	| �`\T.�嘥m_x`5�M�s��F/��/=�6vi������D  C0j�F|dDcќ�Q4�=	dp�4�o�܌�������+���O,C:��ڬ����|ɫX}ϣ�U���I%�I��
+ �W4�v-	�������q�ST�\x8���਍�z+g1�q���]����5��?�`Z"��' ����6��͕�a �y�,�n߬ 5Tᤗ�=�E�.��H�
+#@[[���q�|7]�ӗ� �%� >|������2��zr��~��t�����d��j7-�.`2�K׿�+(@�2<үP�ې�3�p����ng�jN�rY�<��Y���/>޲��l�>A²R�U��^bX�"����rMzR�U��OA��t9/g�,�����fv �7Nã��o���8/ ?�V pKp�P&rB�^�>�@I��тC�n?�k1܈2��(i ��p��kM��>f)� e���ji'�.��6�:�����Qǝ�F�M~:� �����J�I[m�� ��7a�	&N����������d�D]�D}�B]�t]�D]�@"f 3�hH��|hJ�aLÀ���Z�7� ����x����%�l$T�Ģ�.�����c�WZ}+��5�M$6w�e��+� m����y�Q�F��ylJ���J��>o�<�\�����l�p�U2W�|%��g����ƻ����dh� a���ƘE	��"C�M�r��:��e�&a�*�J	F��t�I��)��H�1��h����\4-F��~N�����mv�0+.��O9p��ʳ����/������:G�k?���|W)lǁ�h�#p����LS ��#-ÀihL�1bh=C��� 26a{id ���@m�
+a�ƌ�დ��[��L��b11�D"n!7���H$���q�pkЫ?��6C�S��ڥe�q&�Y�>
+/S�3�)�-�{�0+� �������(yy(��!S�%���(�->���ěgg���W�"d�ǎ��g�x�
+b�͸M{���L$-�[5��,#wj����O�-�^�?�*(tG,���>��R�3��_�n>� ��fE0�%t�
+}�}G]����g�|�ܺJ����RU7��{������s'���*�����7��V�8c�N=�3��}�>���͝٦��d��&M�:	��\�����	'ns�����>`��Ɏ
+�pT]`���5�vP��Ӗ!C�U�Y�w�Y�5n�Y�>`{�J�2���k����]|�L���<���C?TF�'���� �:��l������~ePT.�%�h[Ĩ��U7ǫ:P�lV�ઞ%�ة�E f�s^�!�[��gQ�q /�ܬ���_z�rM���O t�t���s���ރ��l�ȒO�em��~��E2a(�E	4��hط�T=H�V��A0������Sn;���fl��Qǫ��V�Vo���
+~������~ЗQX��j��S���gH�����F�c� �w�6?Jؑ����{`���s���l?�z¦���\^���o�CI��G��A}�Q���+���,:{���9���۽f�������ݩ,�z��N��+|����q�o�V"㎇�Y�r&[�G���^�w{B�^���Y�N�t�U�b�}���7�:fA�����3b����3��%\>w��o�8���ȍ>`4v9��2�B�����^C1�%�L[���&�n���4�g=6�r����),]ށ�����y�%��T�8b�C��l-�vI�x�U�Q��U;?����^+�����F	?�?���G�0�t�p���5p6����A�WE�翵q�'-�L��j��>�������]C��V<�t6��*f��2���?�ҝ��KW�;����;a� ʢg]۬��*��*~�AG2s9�k��o�L}-*�@������W�x6�ʡW�+�Td�츩�~�\��xpG'?G2 ����w�G��u��Es}M��-4&ch��Аt]}����{M$L�\�N��|�G���^�	`Zn�(���C :��Jc��_� � �::y��.\������? ׵4&rR����*$�NZ���uAW0�.Ⱏ=?�Hg3��n)����-�"Ŀ �}}���v��O�7O1�p�*�chhp�!i�1i�JPg���D2i"�p��h��G�z@Oʆa0��y4����E^��~������?�vk��=��_�;YtC��?��f:�Q���퓄��z������Z���o�Xb��5���̾�*�~�@E�NK��(�C�Bw�H�ё[s�C3��k9�ӵ��zf?��:u�������P2f��S����c�Xm?����g�[��p���6��Ï��M��`3��=��N-Ƈ�m����9��u�z�!|���i  �nQ���U}hT���
+lT��P@;�P: �g=N�s�}f��E���H��V������5X��ǌX��7"'0D`�qG�Ӏ�g���;���0���ȝ�!b����$���&��\��U)r�C�������׊��>~��
+=���P{��y�����oQU��\��t�L�A��M���r[�U�8�i�:�W`a�J t��\���������`4�< B�΢X��ȝ���^U
+��d"������X��_�8��r����aс�<���$	���
+�\�\�D亨M�0U*F�$f���2�V{�/@o9��#
+�(ZW.B?���8l}C��!�j�����4}��ܘ����±50�y?}}�'v}�.�Z4��lE��O�{?�ȟG���^�����E#�@}:7�m��LҊ_B���p����F��8����Wr�b9��b��ᦗ)�ڸi�;L\���@�>�4`�b��
+���e���V�g�O�>quR�C��C�+$�;�L�v����!�5;���7�-�!  
+�IDAT%���AS��HPU�snK��M���p����L��(�O�Q,���V���z�`�b�-VXf�ڌ麮]şD�g�}WPv����g�Iـ  �NC��Π�!��q��a��Alɫ�(����,�|D��\�[*ΈT|�My2+���06<��;����	&{N2����H�0���Ӭ;�|����������g��p�+k'C�ҁ=x9��ZM���S�V�F.�� 2�2�Mj ��g-y3�%Q(�%c��(B��E��S�y�a�I �O�.�ޤc��ܕ��h������+Hce@�x�0�tVWP�cTC�za��)�x�[� oN�!@����
+"�7�?����}��nv�H���Y�a��T� �������J;ٲK��1y~��/��M���_��Z|��Y�!��mQ�[��_���C����o����Q�$�-��ƠK�� �-�����~�ڞ��T��U-������`����x�ߥ�yDm�����mٜ_�]�����!3.E�$yH^�&�mS��� �b���xu�,�������Au-W�]���սÿ9/X��N�$L��Q��յ��"�Ud�������l�e���!g���oC����0����ڣG7�R ���B�٩�`�]�W ����Gg>T8e��  �����kI�<Y�}Z�ygى	,�l[�ڈ^�MDC��d�32.�q���t�{�u��\�}���-�������k$�ބ#	4��*����(w��?�V�9C�_  n��5ś��F�:�5���}*�L!���ŢzV��ve33�Y�d���]F��(Ҟ"�.�q� �|���ﲽ�Zg�N��6ۊɠ�g�u��7}��#t4��z��C���_��0�� ���hWk|��۬����m�A�;�"�������?6�D̼��W���H�2�)�����%����Z�aZ7>������L򹐵�ڒł�7ꘓK$�[�w�H����4 
+ ̚5=��c�c��
+߉���p��Πg�hLg��b�:#}U�t�36r.�L�F���{�����y.ӏN�km{KQ�3Y��DCn"/��g��5��w�ۗ��(4 
+  N��l�IZɠC$a&���zY�b������^[�^N�I�5՝n�� ��e�D�ιL	�j��b7'�N�<�#������#�����&nH��R�� R���<�����|�J�'���hL>��o@��K�j���¼ޡ� 8!�o5��r�o�k݅����*k�֦�O�[�����������9�ȗ|��5�8�طt}�����!=>��_���VP�h�b=�W���MP(�.E���d��wWm������6d���ϜrXk����r��B.��9`�P��'�@�v�  �|��K�\z�!"|t��S�����=����ߧ�v�thUK��e�k���C��-�����U���?��{5��)WmW
+о��1�s �;��d�r�CdS��,xb���\��{���ҥ!��_Z_쩇z���76p���$�s�x5C9(J�ok�v�  �|P�?�W�æ�P.�nr�W6lJ]�as:��}�榺�����8a����yy-���'C�SP9d�Vyq ����; �ek�e�A>O���0zG)����O����'sYWW�c]=v�e�娡>��X��������ܷ������ �O�����0��č���R `�~`�ʢ7C>��0���eޣw��x㋯,���du��<~�7����D:��.��ѱ��Ӿs'jPѡ�BZ����ɿ����򝱭�(alm�n  �W;m"�����@�c7~��HŅz&L�r��7}�i�0#p>��ӹ�}����A����g�� ˗3���� ��;��n����ۆ�#�?h�V�M���z��qW`��ؾ�>�,�`c�|gYV�L���� &y<�����,]m��iїH��@,��㐸`{��  ����N�ǒX��>�؛*w��������,�(~�a����B[��"�R��ln_c��t����$�,�mT?�O�YtE��Dۤ�\-�m�=�t-p� �	�Ǒ2'e�uKV�"5��Wǋd}���	� ���`�2xg�2�\�=i�9:e��=뗐�2m�f�L�hڮ� ����)�\`�
+�� V�vf�+K���S�P�0�����ǘq=_W�l��*V�,+^<n�U�����N �����P�@.��dԭIī^�a�2^d@F��>�
+�I����,� h�JQo���?}l����!�}� L�Hs�U8�#I����F���A:�I�U^ ��/��&��8v�E(E'�tR+�X%b�� �m�'�ٶ�l6�t:��Ɔ����G�|��
+��R�M�?�9���c�6�	��,��,2���m5ʼ��C� �i�4�^�߯��(C!���3}���,� �ND�@�o �GP�'��@�
+��)�~p�0L�g>dY���S����	
+�ݏ�J���,��_|�2���)�����:E�)S��R�ygg��m��֤�,^���f��3M3���^yc�8}������A"��x�Ƈ��#��/��3��P�4��q�a���?�{"r>"�I&�?��_`����P  �7o�m"2@�9��d2����z�[��mM�y��ҥK�w�}���i$��j��:$W��(�H��x���C�����w� ��s    IEND�B`�
+
+--- Disco\images\podcast16.png ---
+
+�PNG
+
+   IHDR         ��a   sBIT|d�   	pHYs   v   vN{&   tEXtSoftware www.inkscape.org��<  0IDAT8�u�_h[eƟsrNҜ&iM��� -�&C-
+���F�4��Ŷ�ъ���z!A�́hg'SW-*H�]���g :�Be����e���I�6�i���}��}^mtE��~�����آ���6Ĉ��^f�bM�P����]S����e6���a|��!�<&	�����Vt/+��,bz����������+C�y\2M�n����@�c����5��s�5e7+y���t$���m��K�Ẹ������7F��E.��'�'��iS�ı3O�,?��ƞ�����	\�J�h�@��7��@�� X�|g���ŵaҕq�%����p�1���/�Yc�cv�8s9��p<��c�����������*�N���LC�]�1s5ܳ�5�kU�����\U���
+J�CYl���ݒ��(z�Bs�2ؤ$XK�J/豇h�'�@k�)�pHI���i7���S9٬�B�$v��
+��ZN�/�/	��#��RHŚ؛�3�$E��Rɘ#'���������[S�Ϯ���� ��p��Z��ꎁ�LM�|��w�#����k� ���:E������ï��5�^}��M;`#��3����^��K�l���⏿� ��C�J%�V��±��;RR�RK�:Ǐ��h��3[N�Z���?9 �͏����k5<,������ՓR� �eR{k����I�N	K_��. ���nrI�,/�0zR+6��_�[�.��<���(o歭���W/�u�!��K�B���swǌ���meڪޘ���K~{}v�j����_���h�"B�    IEND�B`�
+
+--- Disco\images\podcast16_green.png ---
+
+�PNG
+
+   IHDR         ��a   sBIT|d�   	pHYs   v   vN{&   tEXtSoftware www.inkscape.org��<  0IDAT8�u�_h[eƟsrNҜ&iM��� -�&C-
+���F�4��Ŷ�ъ���z!A�́hg'SW-*H�]���g :�Be����e���I�6�i���}��}^mtE��~�����آ���6Ĉ��^f�bM�P����]S����e6���a|��!�<&	�����Vt/+��,bz����������+C�y\2M�n����@�c����5��s�5e7+y���t$���m��K�Ẹ������7F��E.��'�'��iS�ı3O�,?��ƞ�����	\�J�h�@��7��@�� X�|g���ŵaҕq�%����p�1���/�Yc�cv�8s9��p<��c�����������*�N���LC�]�1s5ܳ�5�kU�����\U���
+J�CYl���ݒ��(z�Bs�2ؤ$XK�J/豇h�'�@k�)�pHI���i7���S9٬�B�$v��
+��ZN�/�/	��#��RHŚ؛�3�$E��Rɘ#'���������[S�Ϯ���� ��p��Z��ꎁ�LM�|��w�#����k� ���:E������ï��5�^}��M;`#��3����^��K�l���⏿� ��C�J%�V��±��;RR�RK�:Ǐ��h��3[N�Z���?9 �͏����k5<,������ՓR� �eR{k����I�N	K_��. ���nrI�,/�0zR+6��_�[�.��<���(o歭���W/�u�!��K�B���swǌ���meڪޘ���K~{}v�j����_���h�"B�    IEND�B`�
+
+--- Disco\images\podcast16_yellow.png ---
+
+�PNG
+
+   IHDR         ��a   sBIT|d�   	pHYs   v   vN{&   tEXtSoftware www.inkscape.org��<  0IDAT8�u�_h[eƟsrNҜ&iM��� -�&C-
+���F�4��Ŷ�ъ���z!A�́hg'SW-*H�]���g :�Be����e���I�6�i���}��}^mtE��~�����آ���6Ĉ��^f�bM�P����]S����e6���a|��!�<&	�����Vt/+��,bz����������+C�y\2M�n����@�c����5��s�5e7+y���t$���m��K�Ẹ������7F��E.��'�'��iS�ı3O�,?��ƞ�����	\�J�h�@��7��@�� X�|g���ŵaҕq�%����p�1���/�Yc�cv�8s9��p<��c�����������*�N���LC�]�1s5ܳ�5�kU�����\U���
+J�CYl���ݒ��(z�Bs�2ؤ$XK�J/豇h�'�@k�)�pHI���i7���S9٬�B�$v��
+��ZN�/�/	��#��RHŚ؛�3�$E��Rɘ#'���������[S�Ϯ���� ��p��Z��ꎁ�LM�|��w�#����k� ���:E������ï��5�^}��M;`#��3����^��K�l���⏿� ��C�J%�V��±��;RR�RK�:Ǐ��h��3[N�Z���?9 �͏����k5<,������ՓR� �eR{k����I�N	K_��. ���nrI�,/�0zR+6��_�[�.��<���(o歭���W/�u�!��K�B���swǌ���meڪޘ���K~{}v�j����_���h�"B�    IEND�B`�
+
+--- Disco\images\podcast64.png ---
+
+�PNG
+
+   IHDR   @   @   �iq�   sBIT|d�   	pHYs  �  ��\�r   tEXtSoftware www.inkscape.org��<   IDATx��[y�յ�ݪ��YzV�a@�(�i\������/��#*��&M�1�|��O�&y� q3F�D���y5yF#�	(Q�a��{~����fA����VW�{��~��s�=խp�e�;�l�k�V8KD&
+8��$�	�RD���N*��E�-P�zOb�k��'هS?u8�oɶ�PO�eT���t�!!ADv-y��Zz?���lr±���g�uR���1�f��,�t����n���ݍO}q�P�<$<|���P�]�4
+ :�L��C��7>u�'���!����5zw���A�����k�E�����?���(G��Z�1��IN��x�Bn�b����T�K�r��l�0���|ў#F��E�3@4���� ���0�|����hc�KufPO�`:��I��>}7�+�y�җ;���d%�`?�	p���oTt�W4_��9 �T�d�g�_ ��g
+��1�W�����E��_��rf)/����y�I�n�r�Uk?��?#ez?��
+y�/��|�����Z�$�S$�>��C��VMz��A�|�~�<P~M��.���+�f�A����t��d��iW���)���͗��XC�OrF2
+�9˞���������]��$�����soj>3��8M�MfGx�א�I9Q���REjhJ��\�%��8g���%_\
+����+���'/[7���X���,�K���Gk#,�O����3��,p�@���
+
+H�P ��Ld�y�Tj�����a_c��7��]���|�8������?5�]��ey���<���K��~}l�:ܤ�MY@����A�� ��#�����g��E�H��$/��	�E���M�#_�\�,2�'8�g��s�-����b��z�P�ӛу��g����|��u~ϻ��)l��u�|H��]'/[�4yP,_�η��|�"�/Y5�_��ݮ)?����"��!6�L!���X$�Gж�Z�� o�')�������{��K�8E�%XT@����k��o���vG������K~o���w���mC�O��Nf!��;{8&�W���  � �T���}/ґ��;���pݻbHh�O~�l���$�y���0��HI٘��+
+r��@�����.�ׯϊ�֥��K�0��0��уO ��!�Y?W�q6*jKr��ۖ^����t�w9wܞ$G��:����%@������x鲱���u�{���k�����(�-ʴx�{{וua|��P<<��+ �_�cS��Xղ ʝy�Sd��"����'P�t���G!K=�߾��5%+�H?T�s� Tb}j����� f/9��S��JPCV6L~0��w'�pW.x�������g$@4.��T�r�CS���]�^(�ބ�jQ^:d�����a̹u��Ɍc$y�X���Co,rD�*��@�P�H  �����-�ȷ����sk�|����S�q�c$u2�ERxk}}S� ���~�)��%���5H�i>Ɍ�o\uƶ���x��$���竏-AQY`@�@B���+�8��:��i�#R��ő΋��Z���[In�!���k�����N� қ�Lנn)`��nn~�S1�h@��3)��G� |��ȣk D����m{��j��c�#����I�6�")_�@S}�)���^��pٻ����Oe�% Aµ��`Fccc�/�~f�N�n��誱T�\)X�����*?���f��B�R$P"`96���,�IG�MB�to���׆ !О3����q ��!���D���!c�$@���'	��|�]��~�}׾��NXLF<`��0u�p-��#>ak���^ض���D�ؿ��H�P�N"�p�4��^H��}@-�T@~�-h���J��,6a�P]W
+o7�񤋠D�����;�$d!dy��tu�L��\� u����p{��"�<��OD�>	�P�U�����S]��0rX1t��k�x�Ł�����K�(+	�q	--	�� #y2�?^0RK�s���崵r�I��q�G�a 9
+�����T1j|,À��a
+�P��{��e������T,��r�j*�} ���P ���cx��+<I@I�d�$ɨ_�����Аv���	_�����i���ed�gvҫ�2�����PQBe�u#+1�ܓӊ��D�$KB���	�9)�|����v����_2#���.� �=�޶��[� ��i @/�
+v)@W�f�s���v���N��D��V#��h2s
+���v�'V��^�P]Ĩ�R������ˆ#�d����(t&s�q7��+ބ���P0 %vQ<�� �p��9S�=�Y�
+PJo:�8R/: g���Д����w��q�;q$�z�8��bq�s`����-�H�ɀ���ix3�H/���$���ntt'�ѕ*�Ih����ZqZ��ͯ�T�5Q�2'	��.sV@�g�V3P풴�͛AL+`�+�ZG�S$��g,�4ꪋ�p]B�W�T�9�/{M�(`y� B��`�P�x��y?� �Y�� �LG\7x �\rV@c�Q[�wlq`�[{uR۟m�o�+d��I褓t�H�	$�:P��`��e�� J���p��`*�$��+�!TU�`
+���L��`��u�鳾��T������uw�V�l���"�yÆ{s�V~g�q_�ҟKG`�#�%,�춿|��w/��rcB�Yi�1qұ�z�X���^ ؚ
+J!DP (⸣��Qy��#����Ŗ7>@ڵ*ō--��mN&�"��̴��J�s~��C��\�h�8p�Wl8�AB��� �7�ڶ:���1�3U��' -���R��^o�k"Ja�q#�wA�!�%�:������{BDAZ������wE�q�G��¡[;c�������7_�#h����6l�D�[;O����
+lWຒ�/���^�����mo����~�o�tǎ�qfM�k��{����E�v?��m���@#�<�����^��Z���?*'���چ��/��EQ;:���xq�p��H��`XE��T�4��xW���>tt'2}�;��J7�䅗p��J�̻����|��>��=�خ�r��:�c���-�v���j����(O)RU��f���h�V���b�V��2��$s�u>xh�L w`�Lˀi(J�H
+P	�B'�����DzB����M�9�� 8N@���}	x�����T�FW\hq��޵��|7���&��b�=���X��M,����^°� ��AT�C�*��80�Y��؂i*�]�#�P pc�/|��
+�E������Ơ~7c#�q	����;��G
+L �n�9�ZYC�V���K�L �=]�lYԶ扭��T~XZ*�0�[�>W R�K��8y|�;���L(�t�\8��ѷ,>u P`�R�$F��!Еi��z�+A�f�8���5޿z�C�'2����� ~�� 0k%��o�!X��.�7VZ�C��pe�P~��k�c1~ �>�ޮ
+�g1��d� x��M����z&%j�C�.]�TqŅ�hxZ�O�2Y�H�xa0Sg�tH���H�-"��涥Oq�̱���\�K}>:�g>�v��?�}�  X�nV��Y���'��d{��[ 4��˻�Q���kg۠�̧�L
+ ���Z������Ka�&>�@u��"b~KKcA�`� �#k��z��h��g�G�Z|�$@L&i)��@GpC'�I��4��%�]gf���$Cf�F �`''C!�.� Q��� ���?X3�A�J�K���/]��ӽN
+#�kF<�a���y �D���U� X���IG.����~ʺ < ��̙\= >��_ ���j�3�a�n&$V�k^�����կȖ�_�ƙe�p��/���9 ���  @�}O�䛱��Fb6"�$��F��+јW"�:�c#�O�I���@Ɠ�H�  �j 0���u���?k��M ��9�"X��<T�b�K��@b�P]�}?� ��ӆ�?�&\���T��K�+=���JOB���j�=�l �����z!>&�$ l���� ^��3_�i~_��O@߲� ��06�ZM;�VE��ն_���u�Z�\��#jK5oZ�7���,3_p2��ʸaj��>$�4���Z�p!�?|2\�OW���W��tF�wt'k&G*ʋ�UV����5k �%��Ƨ��~�pu�R�,ɧ�!��ȶ,w��8�F'��<�ReR��9pa"��бo�F�2��ǋ@�[SwԺpQp��gۘ����Ն��p>��	K��*�9z�_fZ�y���sN��w&֘MJ���I�^���<Ӳ,��	�0@Zk صu��c�mI�-m�J@��X o�2�T���'�C����{Xj��U�[PxRic;:�����Z�Fg���飵��PJ����݃q0�zc��j����pj���m⧕��1 x{7�UJ�M��gݖh�ۉ�"!�T&� x'���R����@��ĿB�[O�6=iys/O5D� <_A�E�6�w��ڥeZ�~���a�>y�z�p�w�	ȗY�f=�g*�m�6l�F"�@O,���͛O9��xj	�Bq׵!"p]�|O�(���#N�i�	������a�0�|��/��D(<dҙZ)�
+S��z���'�4ͷ�����bY֫GZ�#N�޽{�����e���?>���7Zٹs��v�iO��;Rk=ZD�	�3[ZZ|�r8��
+��"Ǚ�    IEND�B`�
+
+--- Disco\images\podcast64_green.png ---
+
+�PNG
+
+   IHDR   @   @   �iq�   sBIT|d�   	pHYs  �  ��\�r   tEXtSoftware www.inkscape.org��<   IDATx��[y�յ�ݪ��YzV�a@�(�i\������/��#*��&M�1�|��O�&y� q3F�D���y5yF#�	(Q�a��{~����fA����VW�{��~��s�=խp�e�;�l�k�V8KD&
+8��$�	�RD���N*��E�-P�zOb�k��'هS?u8�oɶ�PO�eT���t�!!ADv-y��Zz?���lr±���g�uR���1�f��,�t����n���ݍO}q�P�<$<|���P�]�4
+ :�L��C��7>u�'���!����5zw���A�����k�E�����?���(G��Z�1��IN��x�Bn�b����T�K�r��l�0���|ў#F��E�3@4���� ���0�|����hc�KufPO�`:��I��>}7�+�y�җ;���d%�`?�	p���oTt�W4_��9 �T�d�g�_ ��g
+��1�W�����E��_��rf)/����y�I�n�r�Uk?��?#ez?��
+y�/��|�����Z�$�S$�>��C��VMz��A�|�~�<P~M��.���+�f�A����t��d��iW���)���͗��XC�OrF2
+�9˞���������]��$�����soj>3��8M�MfGx�א�I9Q���REjhJ��\�%��8g���%_\
+����+���'/[7���X���,�K���Gk#,�O����3��,p�@���
+
+H�P ��Ld�y�Tj�����a_c��7��]���|�8������?5�]��ey���<���K��~}l�:ܤ�MY@����A�� ��#�����g��E�H��$/��	�E���M�#_�\�,2�'8�g��s�-����b��z�P�ӛу��g����|��u~ϻ��)l��u�|H��]'/[�4yP,_�η��|�"�/Y5�_��ݮ)?����"��!6�L!���X$�Gж�Z�� o�')�������{��K�8E�%XT@����k��o���vG������K~o���w���mC�O��Nf!��;{8&�W���  � �T���}/ґ��;���pݻbHh�O~�l���$�y���0��HI٘��+
+r��@�����.�ׯϊ�֥��K�0��0��уO ��!�Y?W�q6*jKr��ۖ^����t�w9wܞ$G��:����%@������x鲱���u�{���k�����(�-ʴx�{{וua|��P<<��+ �_�cS��Xղ ʝy�Sd��"����'P�t���G!K=�߾��5%+�H?T�s� Tb}j����� f/9��S��JPCV6L~0��w'�pW.x�������g$@4.��T�r�CS���]�^(�ބ�jQ^:d�����a̹u��Ɍc$y�X���Co,rD�*��@�P�H  �����-�ȷ����sk�|����S�q�c$u2�ERxk}}S� ���~�)��%���5H�i>Ɍ�o\uƶ���x��$���竏-AQY`@�@B���+�8��:��i�#R��ő΋��Z���[In�!���k�����N� қ�Lנn)`��nn~�S1�h@��3)��G� |��ȣk D����m{��j��c�#����I�6�")_�@S}�)���^��pٻ����Oe�% Aµ��`Fccc�/�~f�N�n��誱T�\)X�����*?���f��B�R$P"`96���,�IG�MB�to���׆ !О3����q ��!���D���!c�$@���'	��|�]��~�}׾��NXLF<`��0u�p-��#>ak���^ض���D�ؿ��H�P�N"�p�4��^H��}@-�T@~�-h���J��,6a�P]W
+o7�񤋠D�����;�$d!dy��tu�L��\� u����p{��"�<��OD�>	�P�U�����S]��0rX1t��k�x�Ł�����K�(+	�q	--	�� #y2�?^0RK�s���崵r�I��q�G�a 9
+�����T1j|,À��a
+�P��{��e������T,��r�j*�} ���P ���cx��+<I@I�d�$ɨ_�����Аv���	_�����i���ed�gvҫ�2�����PQBe�u#+1�ܓӊ��D�$KB���	�9)�|����v����_2#���.� �=�޶��[� ��i @/�
+v)@W�f�s���v���N��D��V#��h2s
+���v�'V��^�P]Ĩ�R������ˆ#�d����(t&s�q7��+ބ���P0 %vQ<�� �p��9S�=�Y�
+PJo:�8R/: g���Д����w��q�;q$�z�8��bq�s`����-�H�ɀ���ix3�H/���$���ntt'�ѕ*�Ih����ZqZ��ͯ�T�5Q�2'	��.sV@�g�V3P풴�͛AL+`�+�ZG�S$��g,�4ꪋ�p]B�W�T�9�/{M�(`y� B��`�P�x��y?� �Y�� �LG\7x �\rV@c�Q[�wlq`�[{uR۟m�o�+d��I褓t�H�	$�:P��`��e�� J���p��`*�$��+�!TU�`
+���L��`��u�鳾��T������uw�V�l���"�yÆ{s�V~g�q_�ҟKG`�#�%,�춿|��w/��rcB�Yi�1qұ�z�X���^ ؚ
+J!DP (⸣��Qy��#����Ŗ7>@ڵ*ō--��mN&�"��̴��J�s~��C��\�h�8p�Wl8�AB��� �7�ڶ:���1�3U��' -���R��^o�k"Ja�q#�wA�!�%�:������{BDAZ������wE�q�G��¡[;c�������7_�#h����6l�D�[;O����
+lWຒ�/���^�����mo����~�o�tǎ�qfM�k��{����E�v?��m���@#�<�����^��Z���?*'���چ��/��EQ;:���xq�p��H��`XE��T�4��xW���>tt'2}�;��J7�䅗p��J�̻����|��>��=�خ�r��:�c���-�v���j����(O)RU��f���h�V���b�V��2��$s�u>xh�L w`�Lˀi(J�H
+P	�B'�����DzB����M�9�� 8N@���}	x�����T�FW\hq��޵��|7���&��b�=���X��M,����^°� ��AT�C�*��80�Y��؂i*�]�#�P pc�/|��
+�E������Ơ~7c#�q	����;��G
+L �n�9�ZYC�V���K�L �=]�lYԶ扭��T~XZ*�0�[�>W R�K��8y|�;���L(�t�\8��ѷ,>u P`�R�$F��!Еi��z�+A�f�8���5޿z�C�'2����� ~�� 0k%��o�!X��.�7VZ�C��pe�P~��k�c1~ �>�ޮ
+�g1��d� x��M����z&%j�C�.]�TqŅ�hxZ�O�2Y�H�xa0Sg�tH���H�-"��涥Oq�̱���\�K}>:�g>�v��?�}�  X�nV��Y���'��d{��[ 4��˻�Q���kg۠�̧�L
+ ���Z������Ka�&>�@u��"b~KKcA�`� �#k��z��h��g�G�Z|�$@L&i)��@GpC'�I��4��%�]gf���$Cf�F �`''C!�.� Q��� ���?X3�A�J�K���/]��ӽN
+#�kF<�a���y �D���U� X���IG.����~ʺ < ��̙\= >��_ ���j�3�a�n&$V�k^�����կȖ�_�ƙe�p��/���9 ���  @�}O�䛱��Fb6"�$��F��+јW"�:�c#�O�I���@Ɠ�H�  �j 0���u���?k��M ��9�"X��<T�b�K��@b�P]�}?� ��ӆ�?�&\���T��K�+=���JOB���j�=�l �����z!>&�$ l���� ^��3_�i~_��O@߲� ��06�ZM;�VE��ն_���u�Z�\��#jK5oZ�7���,3_p2��ʸaj��>$�4���Z�p!�?|2\�OW���W��tF�wt'k&G*ʋ�UV����5k �%��Ƨ��~�pu�R�,ɧ�!��ȶ,w��8�F'��<�ReR��9pa"��бo�F�2��ǋ@�[SwԺpQp��gۘ����Ն��p>��	K��*�9z�_fZ�y���sN��w&֘MJ���I�^���<Ӳ,��	�0@Zk صu��c�mI�-m�J@��X o�2�T���'�C����{Xj��U�[PxRic;:�����Z�Fg���飵��PJ����݃q0�zc��j����pj���m⧕��1 x{7�UJ�M��gݖh�ۉ�"!�T&� x'���R����@��ĿB�[O�6=iys/O5D� <_A�E�6�w��ڥeZ�~���a�>y�z�p�w�	ȗY�f=�g*�m�6l�F"�@O,���͛O9��xj	�Bq׵!"p]�|O�(���#N�i�	������a�0�|��/��D(<dҙZ)�
+S��z���'�4ͷ�����bY֫GZ�#N�޽{�����e���?>���7Zٹs��v�iO��;Rk=ZD�	�3[ZZ|�r8��
+��"Ǚ�    IEND�B`�
+
+--- Disco\images\podcast64_yellow.png ---
+
+�PNG
+
+   IHDR   @   @   �iq�   sBIT|d�   	pHYs  �  ��\�r   tEXtSoftware www.inkscape.org��<   IDATx��[y�յ�ݪ��YzV�a@�(�i\������/��#*��&M�1�|��O�&y� q3F�D���y5yF#�	(Q�a��{~����fA����VW�{��~��s�=խp�e�;�l�k�V8KD&
+8��$�	�RD���N*��E�-P�zOb�k��'هS?u8�oɶ�PO�eT���t�!!ADv-y��Zz?���lr±���g�uR���1�f��,�t����n���ݍO}q�P�<$<|���P�]�4
+ :�L��C��7>u�'���!����5zw���A�����k�E�����?���(G��Z�1��IN��x�Bn�b����T�K�r��l�0���|ў#F��E�3@4���� ���0�|����hc�KufPO�`:��I��>}7�+�y�җ;���d%�`?�	p���oTt�W4_��9 �T�d�g�_ ��g
+��1�W�����E��_��rf)/����y�I�n�r�Uk?��?#ez?��
+y�/��|�����Z�$�S$�>��C��VMz��A�|�~�<P~M��.���+�f�A����t��d��iW���)���͗��XC�OrF2
+�9˞���������]��$�����soj>3��8M�MfGx�א�I9Q���REjhJ��\�%��8g���%_\
+����+���'/[7���X���,�K���Gk#,�O����3��,p�@���
+
+H�P ��Ld�y�Tj�����a_c��7��]���|�8������?5�]��ey���<���K��~}l�:ܤ�MY@����A�� ��#�����g��E�H��$/��	�E���M�#_�\�,2�'8�g��s�-����b��z�P�ӛу��g����|��u~ϻ��)l��u�|H��]'/[�4yP,_�η��|�"�/Y5�_��ݮ)?����"��!6�L!���X$�Gж�Z�� o�')�������{��K�8E�%XT@����k��o���vG������K~o���w���mC�O��Nf!��;{8&�W���  � �T���}/ґ��;���pݻbHh�O~�l���$�y���0��HI٘��+
+r��@�����.�ׯϊ�֥��K�0��0��уO ��!�Y?W�q6*jKr��ۖ^����t�w9wܞ$G��:����%@������x鲱���u�{���k�����(�-ʴx�{{וua|��P<<��+ �_�cS��Xղ ʝy�Sd��"����'P�t���G!K=�߾��5%+�H?T�s� Tb}j����� f/9��S��JPCV6L~0��w'�pW.x�������g$@4.��T�r�CS���]�^(�ބ�jQ^:d�����a̹u��Ɍc$y�X���Co,rD�*��@�P�H  �����-�ȷ����sk�|����S�q�c$u2�ERxk}}S� ���~�)��%���5H�i>Ɍ�o\uƶ���x��$���竏-AQY`@�@B���+�8��:��i�#R��ő΋��Z���[In�!���k�����N� қ�Lנn)`��nn~�S1�h@��3)��G� |��ȣk D����m{��j��c�#����I�6�")_�@S}�)���^��pٻ����Oe�% Aµ��`Fccc�/�~f�N�n��誱T�\)X�����*?���f��B�R$P"`96���,�IG�MB�to���׆ !О3����q ��!���D���!c�$@���'	��|�]��~�}׾��NXLF<`��0u�p-��#>ak���^ض���D�ؿ��H�P�N"�p�4��^H��}@-�T@~�-h���J��,6a�P]W
+o7�񤋠D�����;�$d!dy��tu�L��\� u����p{��"�<��OD�>	�P�U�����S]��0rX1t��k�x�Ł�����K�(+	�q	--	�� #y2�?^0RK�s���崵r�I��q�G�a 9
+�����T1j|,À��a
+�P��{��e������T,��r�j*�} ���P ���cx��+<I@I�d�$ɨ_�����Аv���	_�����i���ed�gvҫ�2�����PQBe�u#+1�ܓӊ��D�$KB���	�9)�|����v����_2#���.� �=�޶��[� ��i @/�
+v)@W�f�s���v���N��D��V#��h2s
+���v�'V��^�P]Ĩ�R������ˆ#�d����(t&s�q7��+ބ���P0 %vQ<�� �p��9S�=�Y�
+PJo:�8R/: g���Д����w��q�;q$�z�8��bq�s`����-�H�ɀ���ix3�H/���$���ntt'�ѕ*�Ih����ZqZ��ͯ�T�5Q�2'	��.sV@�g�V3P풴�͛AL+`�+�ZG�S$��g,�4ꪋ�p]B�W�T�9�/{M�(`y� B��`�P�x��y?� �Y�� �LG\7x �\rV@c�Q[�wlq`�[{uR۟m�o�+d��I褓t�H�	$�:P��`��e�� J���p��`*�$��+�!TU�`
+���L��`��u�鳾��T������uw�V�l���"�yÆ{s�V~g�q_�ҟKG`�#�%,�춿|��w/��rcB�Yi�1qұ�z�X���^ ؚ
+J!DP (⸣��Qy��#����Ŗ7>@ڵ*ō--��mN&�"��̴��J�s~��C��\�h�8p�Wl8�AB��� �7�ڶ:���1�3U��' -���R��^o�k"Ja�q#�wA�!�%�:������{BDAZ������wE�q�G��¡[;c�������7_�#h����6l�D�[;O����
+lWຒ�/���^�����mo����~�o�tǎ�qfM�k��{����E�v?��m���@#�<�����^��Z���?*'���چ��/��EQ;:���xq�p��H��`XE��T�4��xW���>tt'2}�;��J7�䅗p��J�̻����|��>��=�خ�r��:�c���-�v���j����(O)RU��f���h�V���b�V��2��$s�u>xh�L w`�Lˀi(J�H
+P	�B'�����DzB����M�9�� 8N@���}	x�����T�FW\hq��޵��|7���&��b�=���X��M,����^°� ��AT�C�*��80�Y��؂i*�]�#�P pc�/|��
+�E������Ơ~7c#�q	����;��G
+L �n�9�ZYC�V���K�L �=]�lYԶ扭��T~XZ*�0�[�>W R�K��8y|�;���L(�t�\8��ѷ,>u P`�R�$F��!Еi��z�+A�f�8���5޿z�C�'2����� ~�� 0k%��o�!X��.�7VZ�C��pe�P~��k�c1~ �>�ޮ
+�g1��d� x��M����z&%j�C�.]�TqŅ�hxZ�O�2Y�H�xa0Sg�tH���H�-"��涥Oq�̱���\�K}>:�g>�v��?�}�  X�nV��Y���'��d{��[ 4��˻�Q���kg۠�̧�L
+ ���Z������Ka�&>�@u��"b~KKcA�`� �#k��z��h��g�G�Z|�$@L&i)��@GpC'�I��4��%�]gf���$Cf�F �`''C!�.� Q��� ���?X3�A�J�K���/]��ӽN
+#�kF<�a���y �D���U� X���IG.����~ʺ < ��̙\= >��_ ���j�3�a�n&$V�k^�����կȖ�_�ƙe�p��/���9 ���  @�}O�䛱��Fb6"�$��F��+јW"�:�c#�O�I���@Ɠ�H�  �j 0���u���?k��M ��9�"X��<T�b�K��@b�P]�}?� ��ӆ�?�&\���T��K�+=���JOB���j�=�l �����z!>&�$ l���� ^��3_�i~_��O@߲� ��06�ZM;�VE��ն_���u�Z�\��#jK5oZ�7���,3_p2��ʸaj��>$�4���Z�p!�?|2\�OW���W��tF�wt'k&G*ʋ�UV����5k �%��Ƨ��~�pu�R�,ɧ�!��ȶ,w��8�F'��<�ReR��9pa"��бo�F�2��ǋ@�[SwԺpQp��gۘ����Ն��p>��	K��*�9z�_fZ�y���sN��w&֘MJ���I�^���<Ӳ,��	�0@Zk صu��c�mI�-m�J@��X o�2�T���'�C����{Xj��U�[PxRic;:�����Z�Fg���飵��PJ����݃q0�zc��j����pj���m⧕��1 x{7�UJ�M��gݖh�ۉ�"!�T&� x'���R����@��ĿB�[O�6=iys/O5D� <_A�E�6�w��ڥeZ�~���a�>y�z�p�w�	ȗY�f=�g*�m�6l�F"�@O,���͛O9��xj	�Bq׵!"p]�|O�(���#N�i�	������a�0�|��/��D(<dҙZ)�
+S��z���'�4ͷ�����bY֫GZ�#N�޽{�����e���?>���7Zٹs��v�iO��;Rk=ZD�	�3[ZZ|�r8��
+��"Ǚ�    IEND�B`�
+
+--- Disco\manifest.json ---
+
+{
+  "manifest_version": 3,
+  "name": "Tab Audio-to-RGB Converter",
+  "version": "1.0",
+  "description": "Captures tab audio frequency and converts it to RGB colors",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://localhost:*/"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/podcast16.png",
+      "64": "images/podcast64.png",
+      "128": "images/podcast128.png"
+    }
+  },
+  "icons": {
+    "16": "images/podcast16.png",
+    "64": "images/podcast64.png",
+    "128": "images/podcast128.png"
+  }
+}
+
+--- Disco\popup.html ---
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tab Audio-to-RGB Converter</title>
+  <style>
+    body {
+      width: 300px;
+      padding: 15px;
+      font-family: Arial, sans-serif;
+    }
+    
+    .container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    
+    .header {
+      font-size: 18px;
+      font-weight: bold;
+      margin-bottom: 8px;
+      text-align: center;
+    }
+    
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 8px;
+      background-color: #f5f5f5;
+      border-radius: 4px;
+    }
+    
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background-color: red;
+    }
+    
+    .status-indicator.active {
+      background-color: green;
+    }
+    
+    .controls {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin: 10px 0;
+    }
+    
+    button {
+      padding: 10px 18px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: background-color 0.2s;
+    }
+    
+    button:hover {
+      opacity: 0.9;
+    }
+    
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    
+    button.start {
+      background-color: #4CAF50;
+      color: white;
+    }
+    
+    button.stop {
+      background-color: #f44336;
+      color: white;
+    }
+    
+    .info-panel {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 10px;
+      background-color: #f9f9f9;
+    }
+    
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    
+    .color-preview {
+      width: 100%;
+      height: 40px;
+      border-radius: 4px;
+      margin-top: 10px;
+    }
+    
+    .instruction-container {
+      background-color: #e1f5fe;
+      border: 1px solid #b3e5fc;
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    
+    .important {
+      color: #d32f2f;
+      font-weight: bold;
+    }
+    
+    .error-container {
+      background-color: #ffebee;
+      color: #c62828;
+      border: 1px solid #ef9a9a;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      display: none;
+    }
+    
+    .error-container.visible {
+      display: block;
+    }
+    
+    .footnote {
+      font-size: 11px;
+      color: #666;
+      margin-top: 10px;
+      text-align: center;
+    }
+    
+    .background-info {
+      background-color: #e8f5e9;
+      border: 1px solid #c8e6c9;
+      border-radius: 4px;
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">Tab Audio-to-RGB Converter</div>
+    
+    <div class="instruction-container">
+      <strong>Instructions:</strong>
+      <ol style="margin: 5px 0 5px 20px; padding: 0;">
+        <li>Navigate to the tab playing audio</li>
+        <li>Click "Start Capture" below</li>
+        <li>When prompted, select <span class="important">"Current Tab"</span></li>
+        <li>Make sure <span class="important">"Share audio"</span> is checked</li>
+        <li>Click "Share" to begin</li>
+      </ol>
+    </div>
+    
+    <div class="status">
+      <div id="statusIndicator" class="status-indicator"></div>
+      <span id="statusText">Checking status...</span>
+    </div>
+    
+    <div class="controls">
+      <button id="startBtn" class="start">Start Capture</button>
+      <button id="stopBtn" class="stop" disabled>Stop Capture</button>
+    </div>
+    
+    <div class="error-container" id="errorContainer">
+      <strong>Error:</strong> <span id="errorMessage"></span>
+    </div>
+    
+    <div class="info-panel">
+      <div class="info-row">
+        <span>Dominant Frequency:</span>
+        <span id="frequencyValue">0 Hz</span>
+      </div>
+      <div class="info-row">
+        <span>Wavelength:</span>
+        <span id="wavelengthValue">0 nm</span>
+      </div>
+      <div class="info-row">
+        <span>RGB Values:</span>
+        <span id="rgbValues">R: 0, G: 0, B: 0</span>
+      </div>
+      <div class="color-preview" id="colorPreview"></div>
+    </div>
+    
+    <div class="background-info">
+      <strong>Background Mode:</strong> Audio processing will continue even when this popup is closed. An "ON" badge shows when active.
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
+
+--- Disco\popup.js ---
+
+// Popup script for Audio-to-RGB Converter
+document.addEventListener('DOMContentLoaded', function() {
+  // DOM Elements
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statusIndicator = document.getElementById('statusIndicator');
+  const statusText = document.getElementById('statusText');
+  const frequencyValue = document.getElementById('frequencyValue');
+  const wavelengthValue = document.getElementById('wavelengthValue');
+  const rgbValues = document.getElementById('rgbValues');
+  const colorPreview = document.getElementById('colorPreview');
+  const errorContainer = document.getElementById('errorContainer');
+  const errorMessage = document.getElementById('errorMessage');
+  
+  // UI update interval
+  let updateInterval = null;
+  
+  // Check current status
+  checkCaptureStatus();
+  
+  // Set up button event listeners
+  startBtn.addEventListener('click', startCapture);
+  stopBtn.addEventListener('click', stopCapture);
+  
+  // Start update interval
+  startUpdateInterval();
+  
+  // Check capture status from background script
+  function checkCaptureStatus() {
+    chrome.runtime.sendMessage({ action: 'getStatus' }, (response) => {
+      if (response) {
+        updateUI(response.isCapturing);
+      }
+    });
+  }
+  
+  // Start audio capture
+  async function startCapture() {
+    hideError();
+    
+    try {
+      // Get the current active tab
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      
+      if (!tabs || tabs.length === 0) {
+        showError('No active tab found');
+        return;
+      }
+      
+      const activeTab = tabs[0];
+      
+      // Check if the tab has an actual URL (not a chrome:// or extension:// URL)
+      if (activeTab.url.startsWith('chrome://') || 
+          activeTab.url.startsWith('chrome-extension://') ||
+          activeTab.url.startsWith('edge://')) {
+        showError('Cannot capture audio from browser system pages. Please navigate to a website.');
+        return;
+      }
+      
+      // Request capture start
+      chrome.runtime.sendMessage({ 
+        action: 'startCapture',
+        tabId: activeTab.id
+      }, (response) => {
+        if (response && response.success) {
+          updateUI(true);
+        } else {
+          showError(response?.error || 'Failed to start capture');
+        }
+      });
+    } catch (error) {
+      showError(`Error: ${error.message}`);
+    }
+  }
+  
+  // Stop audio capture
+  function stopCapture() {
+    chrome.runtime.sendMessage({ action: 'stopCapture' }, (response) => {
+      if (response && response.success) {
+        updateUI(false);
+      } else {
+        showError(response?.error || 'Failed to stop capture');
+      }
+    });
+  }
+  
+  // Update UI based on capture state
+  function updateUI(isCapturing) {
+    if (isCapturing) {
+      statusIndicator.classList.add('active');
+      statusText.textContent = 'Capturing (Background Mode Active)';
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    } else {
+      statusIndicator.classList.remove('active');
+      statusText.textContent = 'Not capturing';
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  }
+  
+  // Start update interval for frequency display
+  function startUpdateInterval() {
+    if (updateInterval) {
+      clearInterval(updateInterval);
+    }
+    
+    updateInterval = setInterval(() => {
+      updateFrequencyDisplay();
+    }, 100);
+  }
+  
+  // Update frequency display from storage
+  function updateFrequencyDisplay() {
+    chrome.storage.local.get(['currentFrequency', 'currentRGB', 'lastUpdated'], (data) => {
+      // Only update if we have recent data (within the last second)
+      if (data.lastUpdated && Date.now() - data.lastUpdated < 1000) {
+        if (data.currentFrequency) {
+          // Update frequency
+          frequencyValue.textContent = `${data.currentFrequency.toFixed(2)} Hz`;
+          
+          // Calculate and update wavelength
+          const speedOfLight = 299792458000000000; // nm/s
+          const wavelength = speedOfLight / data.currentFrequency;
+          wavelengthValue.textContent = `${wavelength.toFixed(2)} nm`;
+        }
+        
+        if (data.currentRGB) {
+          const rgb = data.currentRGB;
+          rgbValues.textContent = `R: ${rgb.r}, G: ${rgb.g}, B: ${rgb.b}`;
+          colorPreview.style.backgroundColor = `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
+        }
+      }
+    });
+  }
+  
+  // Show error message
+  function showError(message) {
+    errorMessage.textContent = message;
+    errorContainer.classList.add('visible');
+  }
+  
+  // Hide error message
+  function hideError() {
+    errorContainer.classList.remove('visible');
+  }
+  
+  // Clean up on unload
+  window.addEventListener('unload', () => {
+    if (updateInterval) {
+      clearInterval(updateInterval);
+    }
+  });
+});
