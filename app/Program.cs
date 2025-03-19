@@ -7,16 +7,21 @@ using GHelper.Input;
 using GHelper.Mode;
 using GHelper.Peripherals;
 using GHelper.USB;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Win32;
 using Ryzen;
 using System.Diagnostics;
+using System.Drawing;
 using System.Globalization;
 using System.Reflection;
+using System.Text.Json;
 using static NativeMethods;
 
 namespace GHelper
 {
-
     static class Program
     {
         public static NotifyIcon trayIcon = new NotifyIcon
@@ -33,7 +38,7 @@ namespace GHelper
         public static ModeControl modeControl = new ModeControl();
         public static GPUModeControl gpuControl = new GPUModeControl(settingsForm);
         public static AllyControl allyControl = new AllyControl(settingsForm);
-        public static ScreenControl screenControl = new ScreenControl(); 
+        public static ScreenControl screenControl = new ScreenControl();
         public static ClamshellModeControl clamshellControl = new ClamshellModeControl();
 
         public static ToastForm toast = new ToastForm();
@@ -45,12 +50,14 @@ namespace GHelper
 
         public static InputDispatcher? inputDispatcher;
 
+        // RGB Keyboard API controller
+        private static RgbKeyboardApi? rgbKeyboardApi;
+
         private static PowerLineStatus isPlugged = SystemInformation.PowerStatus.PowerLineStatus;
 
         // The main entry point for the application
         public static void Main(string[] args)
         {
-
             string action = "";
             if (args.Length > 0) action = args[0];
 
@@ -113,6 +120,10 @@ namespace GHelper
 
             SetAutoModes(init: true);
 
+            // Initialize and start the RGB Keyboard API
+            rgbKeyboardApi = new RgbKeyboardApi(acpi);
+            Task.Run(() => rgbKeyboardApi.StartAsync());
+
             // Subscribing for system power change events
             SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
             SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
@@ -126,7 +137,6 @@ namespace GHelper
             // Subscribing for monitor power on events
             unRegPowerNotify = NativeMethods.RegisterPowerSettingNotification(settingsForm.Handle, PowerSettingGuid.ConsoleDisplayState, NativeMethods.DEVICE_NOTIFY_WINDOW_HANDLE);
             unRegPowerNotifyLid = NativeMethods.RegisterPowerSettingNotification(settingsForm.Handle, PowerSettingGuid.LIDSWITCH_STATE_CHANGE, NativeMethods.DEVICE_NOTIFY_WINDOW_HANDLE);
-
 
             Task task = Task.Run((Action)PeripheralsProvider.DetectAllAsusMice);
             PeripheralsProvider.RegisterForDeviceEvents();
@@ -165,15 +175,23 @@ namespace GHelper
             }
 
             Application.Run();
-
         }
-
 
         private static void SystemEvents_SessionEnding(object sender, SessionEndingEventArgs e)
         {
             gpuControl.StandardModeFix();
             BatteryControl.AutoBattery();
             InputDispatcher.ShutdownStatusLed();
+
+            // Shutdown RGB API if running
+            if (rgbKeyboardApi != null)
+            {
+                try
+                {
+                    rgbKeyboardApi.StopAsync().Wait();
+                }
+                catch { /* Ignore errors during shutdown */ }
+            }
         }
 
         private static void SystemEvents_SessionSwitch(object sender, SessionSwitchEventArgs e)
@@ -187,7 +205,6 @@ namespace GHelper
 
         static void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
         {
-
             if (Math.Abs(DateTimeOffset.Now.ToUnixTimeMilliseconds() - lastTheme) < 2000) return;
 
             switch (e.Category)
@@ -221,11 +238,8 @@ namespace GHelper
             }
         }
 
-
-
         public static bool SetAutoModes(bool powerChanged = false, bool init = false)
         {
-
             if (Math.Abs(DateTimeOffset.Now.ToUnixTimeMilliseconds() - lastAuto) < 3000) return false;
             lastAuto = DateTimeOffset.Now.ToUnixTimeMilliseconds();
 
@@ -331,10 +345,7 @@ namespace GHelper
         {
             if (e.Button == MouseButtons.Left)
                 SettingsToggle(trayClick: true);
-
         }
-
-
 
         static void OnExit(object sender, EventArgs e)
         {
@@ -343,6 +354,17 @@ namespace GHelper
             clamshellControl.UnregisterDisplayEvents();
             NativeMethods.UnregisterPowerSettingNotification(unRegPowerNotify);
             NativeMethods.UnregisterPowerSettingNotification(unRegPowerNotifyLid);
+
+            // Stop the RGB API server if running
+            if (rgbKeyboardApi != null)
+            {
+                try
+                {
+                    rgbKeyboardApi.StopAsync().Wait();
+                }
+                catch { /* Ignore errors during shutdown */ }
+            }
+
             Application.Exit();
         }
 
@@ -363,6 +385,5 @@ namespace GHelper
                 Logger.WriteLine("Startup Battery Limit Error: " + ex.Message);
             }
         }
-
     }
 }
